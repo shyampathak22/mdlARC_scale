@@ -106,6 +106,11 @@ class TrainConfig:
     uniform_loss_weight: bool = True  # If True, all tokens weighted equally (original mdlARC)
     input_loss_weight: float = 1.0  # Weight for input portion (if uniform_loss_weight=False)
     output_loss_weight: float = 1.0  # Weight for output portion (if uniform_loss_weight=False)
+    output_token_weight: float = 1.0  # Scale loss on output tokens (1.0 = no scaling)
+    balance_output_colors: bool = False  # Reweight rare output colors
+    output_color_balance_power: float = 0.5  # Exponent for inverse-frequency weighting
+    output_color_balance_max: float = 5.0  # Clamp for color weights
+    output_color_balance_eps: float = 1e-3  # Smoothing for color counts
 
     # Logging
     use_wandb: bool = True  # Enable W&B logging
@@ -210,6 +215,11 @@ class TrainConfig:
             flat["uniform_loss_weight"] = lo.get("uniform_loss_weight", True)
             flat["input_loss_weight"] = lo.get("input_loss_weight", 1.0)
             flat["output_loss_weight"] = lo.get("output_loss_weight", 1.0)
+            flat["output_token_weight"] = lo.get("output_token_weight", 1.0)
+            flat["balance_output_colors"] = lo.get("balance_output_colors", False)
+            flat["output_color_balance_power"] = lo.get("output_color_balance_power", 0.5)
+            flat["output_color_balance_max"] = lo.get("output_color_balance_max", 5.0)
+            flat["output_color_balance_eps"] = lo.get("output_color_balance_eps", 1e-3)
 
         # [misc] section
         if "misc" in data:
@@ -262,6 +272,11 @@ def compute_loss(
     input_loss_weight: float = 1.0,
     output_loss_weight: float = 1.0,
     uniform_weight: bool = True,
+    output_token_weight: float = 1.0,
+    balance_output_colors: bool = False,
+    output_color_balance_power: float = 0.5,
+    output_color_balance_max: float = 5.0,
+    output_color_balance_eps: float = 1e-3,
 ) -> dict[str, torch.Tensor]:
     """
     Compute cross-entropy loss with separate input/output tracking.
@@ -279,6 +294,11 @@ def compute_loss(
         input_loss_weight: Weight for input portion (only used if uniform_weight=False)
         output_loss_weight: Weight for output portion (only used if uniform_weight=False)
         uniform_weight: If True, all tokens weighted equally (matches original mdlARC)
+        output_token_weight: Multiplier for output-token loss (1.0 = no scaling)
+        balance_output_colors: If True, reweight rare output colors
+        output_color_balance_power: Power for inverse-frequency color weights
+        output_color_balance_max: Max clamp for color weights
+        output_color_balance_eps: Smoothing term for color counts
 
     Returns:
         Dict with 'loss', 'input_loss', 'output_loss'
@@ -302,20 +322,43 @@ def compute_loss(
     loss_fct = nn.CrossEntropyLoss(reduction="none")
     per_token_loss = loss_fct(flat_logits, flat_labels)
 
-    # Apply attention mask (ignore padding)
-    per_token_loss = per_token_loss * flat_mask
+    # Build per-token weights
+    weights = torch.ones_like(shift_mask, dtype=per_token_loss.dtype)
+    if output_token_weight != 1.0:
+        weights = weights + (output_token_weight - 1.0) * shift_output_mask
+
+    if balance_output_colors:
+        color_mask = (shift_labels < 10) & (shift_output_mask > 0)
+        if color_mask.any():
+            colors = shift_labels[color_mask]
+            counts = torch.bincount(colors, minlength=10).to(per_token_loss.dtype)
+            present = counts > 0
+            inv = (counts + output_color_balance_eps).pow(-output_color_balance_power)
+            if present.any():
+                inv = inv / inv[present].mean().clamp(min=1e-6)
+            inv = inv.clamp(max=output_color_balance_max)
+            color_weights = inv.to(per_token_loss.dtype)
+            weights[color_mask] = weights[color_mask] * color_weights[colors]
+
+    flat_weights = weights.view(-1)
+
+    # Apply attention mask and weights (ignore padding)
+    weighted_mask = flat_mask * flat_weights
+    per_token_loss = per_token_loss * weighted_mask
 
     # Separate input and output losses (for monitoring)
     input_mask = flat_mask * (1 - flat_output_mask)  # Valid tokens that are NOT output
     output_mask_final = flat_mask * flat_output_mask  # Valid tokens that ARE output
 
     # Compute mean losses (avoid div by zero)
-    input_token_count = input_mask.sum().clamp(min=1)
-    output_token_count = output_mask_final.sum().clamp(min=1)
-    total_token_count = flat_mask.sum().clamp(min=1)
+    input_weight = weighted_mask * (1 - flat_output_mask)
+    output_weight = weighted_mask * flat_output_mask
+    input_token_count = input_weight.sum().clamp(min=1)
+    output_token_count = output_weight.sum().clamp(min=1)
+    total_token_count = weighted_mask.sum().clamp(min=1)
 
-    input_loss = (per_token_loss * input_mask).sum() / input_token_count
-    output_loss = (per_token_loss * output_mask_final).sum() / output_token_count
+    input_loss = (per_token_loss * (1 - flat_output_mask)).sum() / input_token_count
+    output_loss = (per_token_loss * flat_output_mask).sum() / output_token_count
 
     # Combined loss
     if uniform_weight:
@@ -612,6 +655,11 @@ def train_one_epoch(
                     input_loss_weight=config.input_loss_weight,
                     output_loss_weight=config.output_loss_weight,
                     uniform_weight=config.uniform_loss_weight,
+                    output_token_weight=config.output_token_weight,
+                    balance_output_colors=config.balance_output_colors,
+                    output_color_balance_power=config.output_color_balance_power,
+                    output_color_balance_max=config.output_color_balance_max,
+                    output_color_balance_eps=config.output_color_balance_eps,
                 )
                 # Scale loss by accumulation steps
                 loss = losses["loss"] / grad_accum_steps
@@ -812,6 +860,11 @@ def validate(
                 input_loss_weight=config.input_loss_weight,
                 output_loss_weight=config.output_loss_weight,
                 uniform_weight=config.uniform_loss_weight,
+                output_token_weight=config.output_token_weight,
+                balance_output_colors=config.balance_output_colors,
+                output_color_balance_power=config.output_color_balance_power,
+                output_color_balance_max=config.output_color_balance_max,
+                output_color_balance_eps=config.output_color_balance_eps,
             )
 
         # Compute accuracy
@@ -1488,6 +1541,11 @@ Examples:
     parser.add_argument("--output-loss-weight", type=float, help="Weight for output loss")
     parser.add_argument("--uniform-loss-weight", dest="uniform_loss_weight", action="store_true")
     parser.add_argument("--no-uniform-loss-weight", dest="uniform_loss_weight", action="store_false")
+    parser.add_argument("--output-token-weight", type=float, help="Scale loss for output tokens")
+    parser.add_argument("--balance-output-colors", action="store_true", help="Reweight rare output colors")
+    parser.add_argument("--output-color-balance-power", type=float, help="Power for color reweighting")
+    parser.add_argument("--output-color-balance-max", type=float, help="Clamp for color weights")
+    parser.add_argument("--output-color-balance-eps", type=float, help="Smoothing for color counts")
     parser.add_argument("--no-concept", action="store_true", help="Exclude ConceptARC from training data")
     parser.add_argument("--train-split-only", action="store_true", help="Train only on train split pairs")
     parser.set_defaults(uniform_loss_weight=None)
@@ -1567,6 +1625,16 @@ Examples:
             config.uniform_loss_weight = False
     if args.uniform_loss_weight is not None:
         config.uniform_loss_weight = args.uniform_loss_weight
+    if args.output_token_weight is not None:
+        config.output_token_weight = args.output_token_weight
+    if args.balance_output_colors:
+        config.balance_output_colors = True
+    if args.output_color_balance_power is not None:
+        config.output_color_balance_power = args.output_color_balance_power
+    if args.output_color_balance_max is not None:
+        config.output_color_balance_max = args.output_color_balance_max
+    if args.output_color_balance_eps is not None:
+        config.output_color_balance_eps = args.output_color_balance_eps
     if args.no_concept:
         config.include_concept = False
     if args.train_split_only:

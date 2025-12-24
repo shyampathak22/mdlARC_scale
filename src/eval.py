@@ -13,11 +13,14 @@ import json
 import logging
 from pathlib import Path
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
+from src.data import END_TOKEN_ID, compute_positions_3d, encode_example
 from src.inference import predict_with_augmentations
-from src.train import TrainConfig
+from src.train import TrainConfig, compute_loss, create_output_mask
 from src.transformer import (
     TinyTransformer,
     create_large_model,
@@ -97,6 +100,269 @@ def grids_equal(grid1: list[list[int]], grid2: list[list[int]]) -> bool:
     return True
 
 
+def _build_tta_batch(
+    task: dict,
+    device: torch.device,
+    example_id: int,
+    max_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    tokens_list = []
+    positions_list = []
+
+    for pair in task.get("train", []):
+        tokens = encode_example(pair["input"], pair["output"])
+        if len(tokens) > max_seq_len:
+            continue
+        tokens_list.append(tokens)
+        positions_list.append(compute_positions_3d(tokens))
+
+    if not tokens_list:
+        return None
+
+    max_len = max(len(tokens) for tokens in tokens_list)
+    batch_size = len(tokens_list)
+
+    input_ids = torch.full(
+        (batch_size, max_len),
+        END_TOKEN_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
+    positions_3d = torch.zeros(batch_size, max_len, 3, dtype=torch.long, device=device)
+    example_ids = torch.full((batch_size,), example_id, dtype=torch.long, device=device)
+
+    for i, tokens in enumerate(tokens_list):
+        seq_len = len(tokens)
+        input_ids[i, :seq_len] = torch.tensor(tokens, dtype=torch.long, device=device)
+        attention_mask[i, :seq_len] = True
+        positions_3d[i, :seq_len] = torch.tensor(positions_list[i], dtype=torch.long, device=device)
+
+    return input_ids, positions_3d, attention_mask, example_ids
+
+
+def _adapt_example_embedding(
+    model: TinyTransformer,
+    task: dict,
+    device: torch.device,
+    example_id: int,
+    steps: int,
+    lr: float,
+    weight_decay: float,
+) -> torch.Tensor | None:
+    if steps <= 0:
+        return None
+    if not getattr(model.config, "use_example_embedding", True):
+        return None
+    if not hasattr(model, "example_embed"):
+        return None
+    if example_id < 0 or example_id >= model.example_embed.num_embeddings:
+        return None
+
+    batch = _build_tta_batch(task, device, example_id, model.config.max_seq_len)
+    if batch is None:
+        return None
+    input_ids, positions_3d, attention_mask, example_ids = batch
+
+    original = model.example_embed.weight.data[example_id].detach().clone()
+    params = list(model.parameters())
+    requires_grad = [p.requires_grad for p in params]
+
+    for p in params:
+        p.requires_grad_(False)
+    model.example_embed.weight.requires_grad_(True)
+
+    was_training = model.training
+    model.eval()
+
+    optimizer = torch.optim.Adam([model.example_embed.weight], lr=lr)
+
+    for _ in range(steps):
+        optimizer.zero_grad()
+        logits = model(
+            input_ids,
+            positions_3d,
+            example_ids=example_ids,
+            attention_mask=attention_mask,
+        )
+        output_mask = create_output_mask(input_ids)
+        losses = compute_loss(
+            logits=logits,
+            labels=input_ids,
+            attention_mask=attention_mask,
+            output_mask=output_mask,
+            input_loss_weight=0.0,
+            output_loss_weight=1.0,
+            uniform_weight=False,
+        )
+        loss = losses["loss"]
+        loss.backward()
+        optimizer.step()
+
+        if weight_decay > 0.0:
+            with torch.no_grad():
+                decay = 1.0 - lr * weight_decay
+                model.example_embed.weight.data[example_id].mul_(decay)
+
+    for p, req in zip(params, requires_grad):
+        p.requires_grad_(req)
+
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+
+    return original
+
+
+def _build_tta_batch_for_tasks(
+    task_items: list[tuple[str, dict]],
+    example_id_map: dict[str, int] | None,
+    device: torch.device,
+    max_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    tokens_list: list[list[int]] = []
+    positions_list: list[np.ndarray] = []
+    example_ids_list: list[int] = []
+
+    if example_id_map is None:
+        return None
+
+    for task_id, task in task_items:
+        example_id = example_id_map.get(task_id)
+        if example_id is None:
+            continue
+        for pair in task.get("train", []):
+            tokens = encode_example(pair["input"], pair["output"])
+            if len(tokens) > max_seq_len:
+                continue
+            tokens_list.append(tokens)
+            positions_list.append(compute_positions_3d(tokens))
+            example_ids_list.append(example_id)
+
+    if not tokens_list:
+        return None
+
+    max_len = max(len(tokens) for tokens in tokens_list)
+    batch_size = len(tokens_list)
+
+    input_ids = torch.full(
+        (batch_size, max_len),
+        END_TOKEN_ID,
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
+    positions_3d = torch.zeros(batch_size, max_len, 3, dtype=torch.long, device=device)
+    example_ids = torch.tensor(example_ids_list, dtype=torch.long, device=device)
+
+    for i, tokens in enumerate(tokens_list):
+        seq_len = len(tokens)
+        input_ids[i, :seq_len] = torch.tensor(tokens, dtype=torch.long, device=device)
+        attention_mask[i, :seq_len] = True
+        positions_3d[i, :seq_len] = torch.tensor(positions_list[i], dtype=torch.long, device=device)
+
+    return input_ids, positions_3d, attention_mask, example_ids
+
+
+def _compute_tta_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+    output_mask: torch.Tensor,
+    example_ids: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, seq_len, vocab_size = logits.shape
+
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    shift_mask = attention_mask[:, 1:]
+    shift_output_mask = output_mask[:, 1:]
+
+    valid_mask = shift_mask & shift_output_mask
+    flat_logits = shift_logits.view(-1, vocab_size)
+    flat_labels = shift_labels.view(-1)
+    per_token_loss = F.cross_entropy(flat_logits, flat_labels, reduction="none").view(batch_size, seq_len - 1)
+    per_token_loss = per_token_loss * valid_mask.float()
+
+    token_sum = per_token_loss.sum(dim=1)
+    token_count = valid_mask.sum(dim=1).float()
+
+    unique_ids, inverse = torch.unique(example_ids, return_inverse=True)
+    sum_per_task = torch.zeros_like(unique_ids, dtype=token_sum.dtype)
+    count_per_task = torch.zeros_like(unique_ids, dtype=token_count.dtype)
+    sum_per_task.scatter_add_(0, inverse, token_sum)
+    count_per_task.scatter_add_(0, inverse, token_count)
+
+    task_loss = sum_per_task / count_per_task.clamp(min=1.0)
+    return task_loss.mean()
+
+
+def _adapt_example_embeddings_batched(
+    model: TinyTransformer,
+    task_items: list[tuple[str, dict]],
+    example_id_map: dict[str, int] | None,
+    device: torch.device,
+    steps: int,
+    lr: float,
+    weight_decay: float,
+) -> dict[int, torch.Tensor]:
+    if steps <= 0:
+        return {}
+    if not getattr(model.config, "use_example_embedding", True):
+        return {}
+    if not hasattr(model, "example_embed"):
+        return {}
+
+    batch = _build_tta_batch_for_tasks(task_items, example_id_map, device, model.config.max_seq_len)
+    if batch is None:
+        return {}
+    input_ids, positions_3d, attention_mask, example_ids = batch
+
+    unique_ids = torch.unique(example_ids)
+    original = {int(idx): model.example_embed.weight.data[idx].detach().clone() for idx in unique_ids}
+
+    params = list(model.parameters())
+    requires_grad = [p.requires_grad for p in params]
+
+    for p in params:
+        p.requires_grad_(False)
+    model.example_embed.weight.requires_grad_(True)
+
+    was_training = model.training
+    model.eval()
+
+    optimizer = torch.optim.Adam([model.example_embed.weight], lr=lr)
+
+    for _ in range(steps):
+        optimizer.zero_grad()
+        logits = model(
+            input_ids,
+            positions_3d,
+            example_ids=example_ids,
+            attention_mask=attention_mask,
+        )
+        output_mask = create_output_mask(input_ids)
+        loss = _compute_tta_loss(logits, input_ids, attention_mask, output_mask, example_ids)
+        loss.backward()
+        optimizer.step()
+
+        if weight_decay > 0.0:
+            with torch.no_grad():
+                decay = 1.0 - lr * weight_decay
+                model.example_embed.weight.data[unique_ids].mul_(decay)
+
+    for p, req in zip(params, requires_grad):
+        p.requires_grad_(req)
+
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+
+    return original
+
+
 def evaluate_task(
     model: TinyTransformer,
     task: dict,
@@ -114,6 +380,9 @@ def evaluate_task(
     constrain_decoding: bool = False,
     palette_penalty: float = 2.0,
     shape_penalty: float = 2.0,
+    tta_steps: int = 0,
+    tta_lr: float = 0.0,
+    tta_weight_decay: float = 0.0,
 ) -> dict:
     """
     Evaluate model on a single ARC task.
@@ -135,6 +404,9 @@ def evaluate_task(
         constrain_decoding: If True, apply soft palette/shape constraints
         palette_penalty: Logit penalty for disallowed colors
         shape_penalty: Logit penalty for shape rule violations
+        tta_steps: Number of test-time adaptation steps (0 disables)
+        tta_lr: Learning rate for test-time adaptation
+        tta_weight_decay: Weight decay for test-time adaptation
 
     Returns:
         Dictionary with evaluation results (includes fractional_at_1/2 for ARC-style scoring)
@@ -149,8 +421,22 @@ def evaluate_task(
         "voting_stats": [],
     }
 
-    example_id = example_id_map.get(task_id, 0) if example_id_map else 0
+    example_id = example_id_map.get(task_id) if example_id_map else 0
+    if example_id is None:
+        example_id = 0
     num_tests = len(task["test"])
+
+    original_embed = None
+    if tta_steps > 0 and example_id_map and example_id_map.get(task_id) is not None:
+        original_embed = _adapt_example_embedding(
+            model=model,
+            task=task,
+            device=device,
+            example_id=example_id,
+            steps=tta_steps,
+            lr=tta_lr,
+            weight_decay=tta_weight_decay,
+        )
 
     for test_idx in range(num_tests):
         # Get the test input for filtering input-copy predictions
@@ -201,6 +487,10 @@ def evaluate_task(
             results["correct_at_1"].append(None)
             results["correct_at_2"].append(None)
 
+    if original_embed is not None:
+        with torch.no_grad():
+            model.example_embed.weight.data[example_id].copy_(original_embed)
+
     # Aggregate task-level metrics
     valid_at_1 = [c for c in results["correct_at_1"] if c is not None]
     valid_at_2 = [c for c in results["correct_at_2"] if c is not None]
@@ -235,6 +525,10 @@ def evaluate_dataset(
     constrain_decoding: bool = False,
     palette_penalty: float = 2.0,
     shape_penalty: float = 2.0,
+    tta_steps: int = 0,
+    tta_lr: float = 0.0,
+    tta_weight_decay: float = 0.0,
+    tta_batch_tasks: int = 1,
     show_progress: bool = True,
     rank: int = 0,
     world_size: int = 1,
@@ -258,6 +552,10 @@ def evaluate_dataset(
         constrain_decoding: If True, apply soft palette/shape constraints
         palette_penalty: Logit penalty for disallowed colors
         shape_penalty: Logit penalty for shape rule violations
+        tta_steps: Number of test-time adaptation steps (0 disables)
+        tta_lr: Learning rate for test-time adaptation
+        tta_weight_decay: Weight decay for test-time adaptation
+        tta_batch_tasks: Number of tasks to adapt in a single TTA batch
         show_progress: Whether to show progress bar
         rank: Current process rank (for distributed eval)
         world_size: Total number of processes
@@ -266,10 +564,25 @@ def evaluate_dataset(
         Dictionary with aggregated metrics and per-task results (includes arc_score_at_1/2)
     """
     model.eval()
+    tta_batch_tasks = max(1, tta_batch_tasks)
 
     # Split tasks across GPUs
     all_task_ids = sorted(challenges.keys())
     my_task_ids = all_task_ids[rank::world_size]  # Round-robin assignment
+
+    if tta_steps > 0:
+        local_map = dict(example_id_map) if example_id_map else {}
+        next_id = max(local_map.values(), default=-1) + 1
+        max_examples = getattr(model.config, "num_examples", None)
+        for task_id in my_task_ids:
+            if task_id in local_map:
+                continue
+            if max_examples is None or next_id < max_examples:
+                local_map[task_id] = next_id
+                next_id += 1
+            else:
+                local_map[task_id] = None
+        example_id_map = local_map
 
     results = {
         "total_tasks": len(challenges),
@@ -283,19 +596,23 @@ def evaluate_dataset(
         "per_task_results": {},
     }
 
-    task_iterator = [(tid, challenges[tid]) for tid in my_task_ids]
-    if show_progress and rank == 0:
-        task_iterator = tqdm(task_iterator, desc=f"Evaluating (GPU {rank})", total=len(my_task_ids))
-    elif show_progress:
-        task_iterator = tqdm(task_iterator, desc=f"GPU {rank}", total=len(my_task_ids), position=rank)
+    task_items = [(tid, challenges[tid]) for tid in my_task_ids]
+    pbar = None
+    if show_progress:
+        desc = f"Evaluating (GPU {rank})" if rank == 0 else f"GPU {rank}"
+        pbar_kwargs = {"desc": desc, "total": len(task_items)}
+        if rank != 0:
+            pbar_kwargs["position"] = rank
+        pbar = tqdm(**pbar_kwargs)
 
     correct_so_far = 0
     incorrect_so_far = 0
     evaluated_so_far = 0
 
-    for task_id, task in task_iterator:
-        task_solutions = solutions.get(task_id) if solutions else None
+    def _record_task(task_id: str, task: dict, tta_steps_override: int) -> None:
+        nonlocal correct_so_far, incorrect_so_far, evaluated_so_far
 
+        task_solutions = solutions.get(task_id) if solutions else None
         task_result = evaluate_task(
             model,
             task,
@@ -313,6 +630,9 @@ def evaluate_dataset(
             constrain_decoding=constrain_decoding,
             palette_penalty=palette_penalty,
             shape_penalty=shape_penalty,
+            tta_steps=tta_steps_override,
+            tta_lr=tta_lr,
+            tta_weight_decay=tta_weight_decay,
         )
 
         results["per_task_results"][task_id] = task_result
@@ -333,14 +653,40 @@ def evaluate_dataset(
             results["arc_score_at_2"] += task_result["fractional_at_2"]
             results["arc_tasks_scored"] += 1
 
-        if show_progress and hasattr(task_iterator, "set_postfix"):
+        if pbar is not None:
             total = evaluated_so_far if evaluated_so_far > 0 else 1
             acc = correct_so_far / total
-            task_iterator.set_postfix(
+            pbar.set_postfix(
                 correct=correct_so_far,
                 incorrect=incorrect_so_far,
                 acc=f"{acc:.2%}",
             )
+            pbar.update(1)
+
+    if tta_steps > 0 and tta_batch_tasks > 1:
+        for idx in range(0, len(task_items), tta_batch_tasks):
+            batch_items = task_items[idx : idx + tta_batch_tasks]
+            original_embeds = _adapt_example_embeddings_batched(
+                model=model,
+                task_items=batch_items,
+                example_id_map=example_id_map,
+                device=device,
+                steps=tta_steps,
+                lr=tta_lr,
+                weight_decay=tta_weight_decay,
+            )
+            for task_id, task in batch_items:
+                _record_task(task_id, task, tta_steps_override=0)
+            if original_embeds:
+                with torch.no_grad():
+                    for example_id, embed in original_embeds.items():
+                        model.example_embed.weight.data[example_id].copy_(embed)
+    else:
+        for task_id, task in task_items:
+            _record_task(task_id, task, tta_steps_override=tta_steps)
+
+    if pbar is not None:
+        pbar.close()
 
     # Compute accuracy (will be aggregated across ranks later)
     my_total = len(my_task_ids)
@@ -372,6 +718,10 @@ def generate_submission(
     constrain_decoding: bool = False,
     palette_penalty: float = 2.0,
     shape_penalty: float = 2.0,
+    tta_steps: int = 0,
+    tta_lr: float = 0.0,
+    tta_weight_decay: float = 0.0,
+    tta_batch_tasks: int = 1,
     show_progress: bool = True,
 ) -> None:
     """
@@ -401,19 +751,53 @@ def generate_submission(
         constrain_decoding: If True, apply soft palette/shape constraints
         palette_penalty: Logit penalty for disallowed colors
         shape_penalty: Logit penalty for shape rule violations
+        tta_steps: Number of test-time adaptation steps (0 disables)
+        tta_lr: Learning rate for test-time adaptation
+        tta_weight_decay: Weight decay for test-time adaptation
+        tta_batch_tasks: Number of tasks to adapt in a single TTA batch
         show_progress: Whether to show progress bar
     """
     model.eval()
+    tta_batch_tasks = max(1, tta_batch_tasks)
 
     submission = {}
 
-    task_iterator = challenges.items()
-    if show_progress:
-        task_iterator = tqdm(task_iterator, desc="Generating submission", total=len(challenges))
+    if tta_steps > 0:
+        local_map = dict(example_id_map) if example_id_map else {}
+        next_id = max(local_map.values(), default=-1) + 1
+        max_examples = getattr(model.config, "num_examples", None)
+        for task_id in challenges.keys():
+            if task_id in local_map:
+                continue
+            if max_examples is None or next_id < max_examples:
+                local_map[task_id] = next_id
+                next_id += 1
+            else:
+                local_map[task_id] = None
+        example_id_map = local_map
 
-    for task_id, task in task_iterator:
+    task_items = list(challenges.items())
+    pbar = None
+    if show_progress:
+        pbar = tqdm(total=len(task_items), desc="Generating submission")
+
+    def _generate_task(task_id: str, task: dict, use_tta: bool) -> None:
         task_submissions = []
-        example_id = example_id_map.get(task_id, 0) if example_id_map else 0
+        example_id = example_id_map.get(task_id) if example_id_map else 0
+        if example_id is None:
+            example_id = 0
+
+        original_embed = None
+        if use_tta and tta_steps > 0 and example_id_map and example_id_map.get(task_id) is not None:
+            original_embed = _adapt_example_embedding(
+                model=model,
+                task=task,
+                device=device,
+                example_id=example_id,
+                steps=tta_steps,
+                lr=tta_lr,
+                weight_decay=tta_weight_decay,
+            )
 
         for test_idx in range(len(task["test"])):
             test_input = task["test"][test_idx]["input"]
@@ -454,6 +838,37 @@ def generate_submission(
             task_submissions.append(entry)
 
         submission[task_id] = task_submissions
+
+        if original_embed is not None:
+            with torch.no_grad():
+                model.example_embed.weight.data[example_id].copy_(original_embed)
+        if pbar is not None:
+            pbar.update(1)
+
+    if tta_steps > 0 and tta_batch_tasks > 1:
+        for idx in range(0, len(task_items), tta_batch_tasks):
+            batch_items = task_items[idx : idx + tta_batch_tasks]
+            original_embeds = _adapt_example_embeddings_batched(
+                model=model,
+                task_items=batch_items,
+                example_id_map=example_id_map,
+                device=device,
+                steps=tta_steps,
+                lr=tta_lr,
+                weight_decay=tta_weight_decay,
+            )
+            for task_id, task in batch_items:
+                _generate_task(task_id, task, use_tta=False)
+            if original_embeds:
+                with torch.no_grad():
+                    for example_id, embed in original_embeds.items():
+                        model.example_embed.weight.data[example_id].copy_(embed)
+    else:
+        for task_id, task in task_items:
+            _generate_task(task_id, task, use_tta=True)
+
+    if pbar is not None:
+        pbar.close()
 
     # Write to file
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -617,6 +1032,30 @@ def main():
         help="Logit penalty for shape rule violations (default: 2.0)",
     )
     parser.add_argument(
+        "--tta-steps",
+        type=int,
+        default=0,
+        help="Test-time adaptation steps per task (default: 0)",
+    )
+    parser.add_argument(
+        "--tta-lr",
+        type=float,
+        default=0.1,
+        help="Learning rate for test-time adaptation (default: 0.1)",
+    )
+    parser.add_argument(
+        "--tta-weight-decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for test-time adaptation (default: 0.0)",
+    )
+    parser.add_argument(
+        "--tta-batch-tasks",
+        type=int,
+        default=1,
+        help="Number of tasks to adapt in a single TTA batch (default: 1)",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -710,6 +1149,10 @@ def main():
             constrain_decoding=args.constrained_decoding,
             palette_penalty=args.palette_penalty,
             shape_penalty=args.shape_penalty,
+            tta_steps=args.tta_steps,
+            tta_lr=args.tta_lr,
+            tta_weight_decay=args.tta_weight_decay,
+            tta_batch_tasks=args.tta_batch_tasks,
             show_progress=not args.quiet,
         )
 
@@ -731,6 +1174,10 @@ def main():
             constrain_decoding=args.constrained_decoding,
             palette_penalty=args.palette_penalty,
             shape_penalty=args.shape_penalty,
+            tta_steps=args.tta_steps,
+            tta_lr=args.tta_lr,
+            tta_weight_decay=args.tta_weight_decay,
+            tta_batch_tasks=args.tta_batch_tasks,
             show_progress=not args.quiet,
             rank=rank,
             world_size=world_size,
