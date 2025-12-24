@@ -1,0 +1,48 @@
+# Tiny model config (~3.6M params) - for testing and debugging
+
+[model]
+size = "tiny"
+
+[data]
+path = "data/arc-agi_training_challenges.json"
+solutions_path = "data/arc-agi_training_solutions.json"
+max_seq_len = 1863
+
+[training]
+batch_size = 16
+effective_batch_size = 64
+epochs = 100
+lr = 3e-4
+weight_decay = 0.01
+grad_clip = 1.0
+warmup_fraction = 0.05
+
+[augmentation]
+apply_dihedral = true
+num_color_perms = 100
+color_seed = 42
+
+[hardware]
+compile_model = false  # disabled due to PyTorch Inductor bug with dynamic shapes
+use_amp = true
+num_workers = 4
+
+[checkpointing]
+save_dir = "checkpoints/tiny"
+save_every = 10
+
+[logging]
+use_wandb = true
+wandb_project = "mdlARC_scale"
+log_every = 10
+wandb_log_every = 50
+ema_decay = 0.99
+
+[loss]
+uniform_loss_weight = true
+input_loss_weight = 1.0
+output_loss_weight = 1.0
+
+[misc]
+seed = 42
+peak_tflops = 23.7  # RTX 5060 Ti BF16
