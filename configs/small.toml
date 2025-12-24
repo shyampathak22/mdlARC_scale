@@ -25,7 +25,7 @@ color_seed = 42
 [hardware]
 compile_model = false  # disabled due to PyTorch Inductor bug with dynamic shapes
 use_amp = true
-num_workers = 8
+num_workers = 4
 
 [checkpointing]
 save_dir = "checkpoints/small"

@@ -19,8 +19,11 @@ dependencies = [
 ]
 
 [project.scripts]
-train = "src.train:main"
-evaluate = "src.eval:main"
+train = "scripts.train_wrapper:main"
+train-raw = "src.train:main"
+evaluate = "scripts.eval_wrapper:main"
+evaluate-raw = "src.eval:main"
+ablations = "scripts.ablations:main"
 sanitize = "scripts.sanitize_data:main"
 
 [dependency-groups]

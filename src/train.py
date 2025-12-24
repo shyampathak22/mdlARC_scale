@@ -54,6 +54,10 @@ class TrainConfig:
 
     # Model
     model_size: str = "small"  # tiny, small, medium, large
+    rope_type: str = "3d"  # 3d, 1d, none
+    norm_type: str = "rmsnorm"  # rmsnorm, layernorm
+    ffn_type: str = "swiglu"  # swiglu, gelu
+    use_example_embedding: bool = True
 
     # Data
     data_path: str = "data/challenges.json"
@@ -66,6 +70,8 @@ class TrainConfig:
     val_batch_size: int = 16
     max_seq_len: int = 1863  # Matches original mdlARC
     num_workers: int = 4
+    include_concept: bool = True  # Include ConceptARC in training data
+    train_on_test_split: bool = True  # Include train-task test pairs in training
 
     # Augmentation
     apply_dihedral: bool = True
@@ -142,12 +148,18 @@ class TrainConfig:
         # [model] section
         if "model" in data:
             flat["model_size"] = data["model"].get("size", "small")
+            flat["rope_type"] = data["model"].get("rope_type", "3d")
+            flat["norm_type"] = data["model"].get("norm_type", "rmsnorm")
+            flat["ffn_type"] = data["model"].get("ffn_type", "swiglu")
+            flat["use_example_embedding"] = data["model"].get("use_example_embedding", True)
 
         # [data] section
         if "data" in data:
             flat["data_path"] = data["data"].get("path", "data/challenges.json")
             flat["solutions_path"] = data["data"].get("solutions_path")
             flat["max_seq_len"] = data["data"].get("max_seq_len", 1863)
+            flat["include_concept"] = data["data"].get("include_concept", True)
+            flat["train_on_test_split"] = data["data"].get("train_on_test_split", True)
 
         # [training] section
         if "training" in data:
@@ -966,7 +978,13 @@ def create_model_from_config(config: TrainConfig) -> TinyTransformer:
     if config.model_size not in model_factories:
         raise ValueError(f"Unknown model size: {config.model_size}")
 
-    return model_factories[config.model_size]()
+    return model_factories[config.model_size](
+        max_seq_len=config.max_seq_len,
+        rope_type=config.rope_type,
+        norm_type=config.norm_type,
+        ffn_type=config.ffn_type,
+        use_example_embedding=config.use_example_embedding,
+    )
 
 
 # =============================================================================
@@ -986,11 +1004,11 @@ def cleanup_ddp() -> None:
         dist.destroy_process_group()
 
 
-def ensure_data_exists(data_path: str, solutions_path: str | None) -> None:
+def ensure_data_exists(data_path: str, solutions_path: str | None, include_concept: bool = True) -> None:
     """
     Check if required data files exist, download and build them if not.
 
-    Downloads ARC-1 and ConceptARC to match original mdlARC training data.
+    Downloads ARC-1 and optionally ConceptARC to match original mdlARC training data.
     Called automatically before training starts (only on rank 0).
     """
     from src.data import (
@@ -1016,20 +1034,20 @@ def ensure_data_exists(data_path: str, solutions_path: str | None) -> None:
         print("Downloading ARC-1 dataset...")
         download_dataset("arc1", output_dir=data_dir)
 
-    # Download ConceptARC dataset if needed
     concept_corpus_dir = data_dir / "ConceptARC-main" / "corpus"
-    if not concept_corpus_dir.exists():
+    if include_concept and not concept_corpus_dir.exists():
         print("Downloading ConceptARC dataset...")
         download_dataset("concept", output_dir=data_dir)
 
-    # Build combined challenges JSON (ARC-1 + ConceptARC, matching original mdlARC)
+    # Build challenges JSON (ARC-1 + ConceptARC by default)
     if need_challenges:
-        print(f"Building {data_path} (ARC-1 + ConceptARC)...")
+        sources = [("arc1", arc1_data_dir)]
+        if include_concept:
+            sources.append(("concept", concept_corpus_dir))
+        source_label = "ARC-1 + ConceptARC" if include_concept else "ARC-1 only"
+        print(f"Building {data_path} ({source_label})...")
         build_dataset(
-            sources=[
-                ("arc1", arc1_data_dir),
-                ("concept", concept_corpus_dir),
-            ],
+            sources=sources,
             output_path=data_path,
             strip_eval_outputs=True,  # No eval test outputs (prevent leakage)
             prefix_task_ids=False,  # Don't prefix, keep original task IDs
@@ -1093,7 +1111,7 @@ def train(config: TrainConfig) -> TinyTransformer:
         print(f"Effective batch size: {config.batch_size * world_size * config.grad_accum_steps}")
 
         # Auto-download and build data if missing
-        ensure_data_exists(config.data_path, config.solutions_path)
+        ensure_data_exists(config.data_path, config.solutions_path, config.include_concept)
 
         # Auto-delete eval solutions to prevent data leakage
         sanitize_data_dir(config.data_path)
@@ -1152,11 +1170,13 @@ def train(config: TrainConfig) -> TinyTransformer:
     # for training tasks). This is not cheating - we're using all available data.
     if is_rank_zero:
         print("Loading training data...")
+    train_splits = ("train", "test") if config.train_on_test_split else ("train",)
+    include_test_outputs = config.train_on_test_split
     train_dataset = ARCDataset(
         config.data_path,
-        splits=("train", "test"),  # Both splits - we know all solutions for training tasks
-        include_test_outputs=True,  # Include test outputs for training
-        solutions_path=config.solutions_path,  # Solutions file needed for test outputs
+        splits=train_splits,
+        include_test_outputs=include_test_outputs,
+        solutions_path=config.solutions_path if include_test_outputs else None,
         apply_dihedral=config.apply_dihedral,
         max_seq_len=config.max_seq_len,
     )
@@ -1456,6 +1476,21 @@ Examples:
     parser.add_argument("--wandb-run-name", type=str)
     parser.add_argument("--peak-tflops", type=float)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--rope-type", type=str, choices=["3d", "1d", "none"])
+    parser.add_argument("--norm-type", type=str, choices=["rmsnorm", "layernorm"])
+    parser.add_argument("--ffn-type", type=str, choices=["swiglu", "gelu"])
+    parser.add_argument("--no-example-embedding", action="store_true", help="Disable example embeddings")
+
+    # Ablation-specific overrides
+    parser.add_argument("--no-apply-dihedral", action="store_true", help="Disable dihedral augmentation")
+    parser.add_argument("--num-color-perms", type=int, help="Number of color permutations (0 to disable)")
+    parser.add_argument("--input-loss-weight", type=float, help="Weight for input loss (0 for output-only)")
+    parser.add_argument("--output-loss-weight", type=float, help="Weight for output loss")
+    parser.add_argument("--uniform-loss-weight", dest="uniform_loss_weight", action="store_true")
+    parser.add_argument("--no-uniform-loss-weight", dest="uniform_loss_weight", action="store_false")
+    parser.add_argument("--no-concept", action="store_true", help="Exclude ConceptARC from training data")
+    parser.add_argument("--train-split-only", action="store_true", help="Train only on train split pairs")
+    parser.set_defaults(uniform_loss_weight=None)
 
     args = parser.parse_args()
 
@@ -1495,7 +1530,8 @@ Examples:
         config.compile_model = False
     if args.no_amp:
         config.use_amp = False
-    if args.ddp:
+    if args.ddp or os.environ.get("LOCAL_RANK") is not None:
+        # Auto-detect torchrun by checking for LOCAL_RANK env var
         config.use_ddp = True
     if args.no_wandb:
         config.use_wandb = False
@@ -1507,6 +1543,34 @@ Examples:
         config.peak_tflops = args.peak_tflops
     if args.seed is not None:
         config.seed = args.seed
+    if args.rope_type is not None:
+        config.rope_type = args.rope_type
+    if args.norm_type is not None:
+        config.norm_type = args.norm_type
+    if args.ffn_type is not None:
+        config.ffn_type = args.ffn_type
+    if args.no_example_embedding:
+        config.use_example_embedding = False
+
+    # Ablation overrides
+    if args.no_apply_dihedral:
+        config.apply_dihedral = False
+    if args.num_color_perms is not None:
+        config.num_color_perms = args.num_color_perms
+    if args.input_loss_weight is not None:
+        config.input_loss_weight = args.input_loss_weight
+        if args.uniform_loss_weight is None:
+            config.uniform_loss_weight = False
+    if args.output_loss_weight is not None:
+        config.output_loss_weight = args.output_loss_weight
+        if args.uniform_loss_weight is None:
+            config.uniform_loss_weight = False
+    if args.uniform_loss_weight is not None:
+        config.uniform_loss_weight = args.uniform_loss_weight
+    if args.no_concept:
+        config.include_concept = False
+    if args.train_split_only:
+        config.train_on_test_split = False
 
     train(config)
 

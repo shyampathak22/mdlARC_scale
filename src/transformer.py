@@ -28,6 +28,10 @@ class TransformerConfig:
     max_z: int = 8                # Max z coordinate (matches original mdlARC: 0-4 used)
     rope_base: float = 10000.0    # RoPE base frequency
     norm_eps: float = 1e-5        # RMSNorm epsilon
+    rope_type: str = "3d"         # "3d", "1d", or "none"
+    norm_type: str = "rmsnorm"    # "rmsnorm" or "layernorm"
+    ffn_type: str = "swiglu"      # "swiglu" or "gelu"
+    use_example_embedding: bool = True  # If False, ignore example IDs
 
 
 class RMSNorm(nn.Module):
@@ -42,6 +46,16 @@ class RMSNorm(nn.Module):
         rms = x.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(rms + self.eps)
         return x * self.weight
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    Rotate pairs: (x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)
+    This is the rotation operation used in RoPE.
+    """
+    x1 = x[..., ::2]   # even indices
+    x2 = x[..., 1::2]  # odd indices
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
 class RotaryEmbedding3D(nn.Module):
@@ -113,13 +127,7 @@ class RotaryEmbedding3D(nn.Module):
 
     @staticmethod
     def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        """
-        Rotate pairs: (x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)
-        This is the rotation operation used in RoPE.
-        """
-        x1 = x[..., ::2]   # even indices
-        x2 = x[..., 1::2]  # odd indices
-        return torch.stack((-x2, x1), dim=-1).flatten(-2)
+        return _rotate_half(x)
 
     def apply_rotary(
         self,
@@ -173,10 +181,65 @@ class RotaryEmbedding3D(nn.Module):
         sin_full = sin_full.unsqueeze(2)
 
         # Apply rotation: out = x * cos + rotate_half(x) * sin
-        q_rot = q * cos_full + self._rotate_half(q) * sin_full
-        k_rot = k * cos_full + self._rotate_half(k) * sin_full
+        q_rot = q * cos_full + _rotate_half(q) * sin_full
+        k_rot = k * cos_full + _rotate_half(k) * sin_full
 
         return q_rot, k_rot
+
+
+class RotaryEmbedding1D(nn.Module):
+    """
+    1D Rotary Position Embeddings over sequence positions.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        max_seq_len: int = 2048,
+        base: float = 10000.0,
+    ):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        self.head_dim = head_dim
+        self.max_seq_len = max_seq_len
+        self.base = base
+
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq)
+        self.register_buffer("cos", freqs.cos(), persistent=False)
+        self.register_buffer("sin", freqs.sin(), persistent=False)
+
+    def apply_rotary(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # pos: [B, S]
+        pos = pos.clamp(0, self.max_seq_len - 1).long()
+        cos = self.cos[pos]  # [B, S, head_dim/2]
+        sin = self.sin[pos]
+
+        cos = cos.repeat_interleave(2, dim=-1).unsqueeze(2)
+        sin = sin.repeat_interleave(2, dim=-1).unsqueeze(2)
+
+        q_rot = q * cos + _rotate_half(q) * sin
+        k_rot = k * cos + _rotate_half(k) * sin
+        return q_rot, k_rot
+
+
+def build_norm(norm_type: str, dim: int, eps: float) -> nn.Module:
+    """Factory for normalization layers."""
+    norm = norm_type.lower()
+    if norm == "rmsnorm":
+        return RMSNorm(dim, eps=eps)
+    if norm == "layernorm":
+        return nn.LayerNorm(dim, eps=eps)
+    raise ValueError(f"Unknown norm_type: {norm_type}")
 
 
 class MultiHeadSelfAttention(nn.Module):
@@ -185,6 +248,7 @@ class MultiHeadSelfAttention(nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+        self.rope_type = config.rope_type.lower()
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.scale = self.head_dim ** -0.5
@@ -198,14 +262,25 @@ class MultiHeadSelfAttention(nn.Module):
         # Output projection
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
-        # 3D Rotary embeddings
-        self.rope = RotaryEmbedding3D(
-            head_dim=self.head_dim,
-            max_x=config.max_x,
-            max_y=config.max_y,
-            max_z=config.max_z,
-            base=config.rope_base,
-        )
+        # Rotary embeddings
+        if self.rope_type == "3d":
+            self.rope = RotaryEmbedding3D(
+                head_dim=self.head_dim,
+                max_x=config.max_x,
+                max_y=config.max_y,
+                max_z=config.max_z,
+                base=config.rope_base,
+            )
+        elif self.rope_type == "1d":
+            self.rope = RotaryEmbedding1D(
+                head_dim=self.head_dim,
+                max_seq_len=config.max_seq_len,
+                base=config.rope_base,
+            )
+        elif self.rope_type == "none":
+            self.rope = None
+        else:
+            raise ValueError(f"Unknown rope_type: {config.rope_type}")
 
         self.dropout = nn.Dropout(config.dropout)
 
@@ -242,8 +317,13 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.reshape(batch, seq_len, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)  # Each: [B, S, heads, head_dim]
 
-        # Apply 3D RoPE to Q and K
-        q, k = self.rope.apply_rotary(q, k, pos_xyz)
+        # Apply RoPE to Q and K
+        if self.rope is not None:
+            if self.rope_type == "3d":
+                q, k = self.rope.apply_rotary(q, k, pos_xyz)
+            else:
+                positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch, -1)
+                q, k = self.rope.apply_rotary(q, k, positions)
 
         # Transpose for attention: [B, heads, S, head_dim]
         q = q.transpose(1, 2)
@@ -302,7 +382,17 @@ class MultiHeadSelfAttention(nn.Module):
         q, k, v = qkv.unbind(dim=2)
 
         # Apply RoPE
-        q, k = self.rope.apply_rotary(q, k, pos_xyz)
+        if self.rope is not None:
+            if self.rope_type == "3d":
+                q, k = self.rope.apply_rotary(q, k, pos_xyz)
+            else:
+                positions = torch.full(
+                    (batch, 1),
+                    int(cache_position),
+                    device=x.device,
+                    dtype=torch.long,
+                )
+                q, k = self.rope.apply_rotary(q, k, positions)
 
         # Initialize cache if needed
         if self.k_cache is None or self.k_cache.size(0) != batch:
@@ -361,15 +451,36 @@ class FeedForward(nn.Module):
         return self.dropout(x)
 
 
+class FeedForwardGELU(nn.Module):
+    """Feed-forward network with GELU activation."""
+
+    def __init__(self, config: TransformerConfig):
+        super().__init__()
+        self.fc1 = nn.Linear(config.d_model, config.d_ff)
+        self.fc2 = nn.Linear(config.d_ff, config.d_model)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+        return self.dropout(x)
+
+
 class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm architecture."""
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
-        self.ln1 = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.ln1 = build_norm(config.norm_type, config.d_model, config.norm_eps)
         self.attn = MultiHeadSelfAttention(config)
-        self.ln2 = RMSNorm(config.d_model, eps=config.norm_eps)
-        self.ffn = FeedForward(config)
+        self.ln2 = build_norm(config.norm_type, config.d_model, config.norm_eps)
+        if config.ffn_type.lower() == "swiglu":
+            self.ffn = FeedForward(config)
+        elif config.ffn_type.lower() == "gelu":
+            self.ffn = FeedForwardGELU(config)
+        else:
+            raise ValueError(f"Unknown ffn_type: {config.ffn_type}")
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(
@@ -425,7 +536,7 @@ class TinyTransformer(nn.Module):
         ])
 
         # Final layer norm
-        self.ln_f = RMSNorm(config.d_model, eps=config.norm_eps)
+        self.ln_f = build_norm(config.norm_type, config.d_model, config.norm_eps)
 
         # Language model head (tied with token embeddings optionally)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
@@ -473,7 +584,7 @@ class TinyTransformer(nn.Module):
         x = self.token_embed(input_ids)  # [B, S, d_model]
 
         # Add example embeddings if provided
-        if example_ids is not None:
+        if self.config.use_example_embedding and example_ids is not None:
             ex_embed = self.example_embed(example_ids)  # [B, d_model]
             x = x + ex_embed.unsqueeze(1)  # Broadcast across sequence
 
@@ -520,7 +631,7 @@ class TinyTransformer(nn.Module):
 
         # Process prompt (fill cache)
         x = self.token_embed(input_ids)
-        if example_ids is not None:
+        if self.config.use_example_embedding and example_ids is not None:
             x = x + self.example_embed(example_ids).unsqueeze(1)
 
         for block in self.blocks:
@@ -555,7 +666,7 @@ class TinyTransformer(nn.Module):
 
             # Forward single token through cache
             x = self.token_embed(next_token)
-            if example_ids is not None:
+            if self.config.use_example_embedding and example_ids is not None:
                 x = x + self.example_embed(example_ids).unsqueeze(1)
 
             cache_pos = prompt_len + i
@@ -614,24 +725,24 @@ def create_model(
 
 
 # Convenience functions for different model sizes
-def create_tiny_model() -> TinyTransformer:
+def create_tiny_model(**kwargs) -> TinyTransformer:
     """~3.6M params - for testing."""
-    return create_model(d_model=256, n_heads=4, n_layers=4, d_ff=704)
+    return create_model(d_model=256, n_heads=4, n_layers=4, d_ff=704, **kwargs)
 
 
-def create_small_model() -> TinyTransformer:
+def create_small_model(**kwargs) -> TinyTransformer:
     """~29M params - comparable to original mdlARC 28M."""
-    return create_model(d_model=768, n_heads=12, n_layers=4, d_ff=2048)
+    return create_model(d_model=768, n_heads=12, n_layers=4, d_ff=2048, **kwargs)
 
 
-def create_medium_model() -> TinyTransformer:
+def create_medium_model(**kwargs) -> TinyTransformer:
     """~103M params - scaled up."""
-    return create_model(d_model=1024, n_heads=16, n_layers=8, d_ff=2752)
+    return create_model(d_model=1024, n_heads=16, n_layers=8, d_ff=2752, **kwargs)
 
 
-def create_large_model() -> TinyTransformer:
+def create_large_model(**kwargs) -> TinyTransformer:
     """~237M params - significantly scaled."""
-    return create_model(d_model=1280, n_heads=20, n_layers=12, d_ff=3392)
+    return create_model(d_model=1280, n_heads=20, n_layers=12, d_ff=3392, **kwargs)
 
 
 if __name__ == "__main__":

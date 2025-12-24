@@ -8,7 +8,7 @@ Provides optimized batched generation with:
 - torch.compile() support for kernel fusion
 """
 
-# from dataclasses import dataclass
+from dataclasses import dataclass
 from collections.abc import Callable
 
 import numpy as np
@@ -27,6 +27,21 @@ from src.data import (
     generate_color_permutations,
 )
 from src.transformer import TinyTransformer
+
+# =============================================================================
+# DECODING CONSTRAINTS
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DecodingConstraints:
+    """Optional constraints for soft-constrained decoding."""
+    palette_mask: torch.Tensor | None = None  # [batch, 10] bool mask for allowed colors
+    target_shape: torch.Tensor | None = None  # [batch, 2] (h, w) or -1 for no constraint
+    palette_penalty: float = 2.0
+    shape_penalty: float = 2.0
+    disallow_tokens: tuple[int, ...] = (START_TOKEN_ID, IO_SEP_TOKEN_ID)
+
 
 # =============================================================================
 # STATIC KV CACHE
@@ -112,6 +127,8 @@ class GridStateUpdater:
     def update(self, tokens: torch.Tensor) -> torch.Tensor:
         """Update positions based on tokens, return positions for current step."""
         tokens = tokens.to(self.device)
+        if tokens.dim() > 1:
+            tokens = tokens.squeeze(-1)
         is_start = tokens == START_TOKEN_ID
         is_sep = tokens == IO_SEP_TOKEN_ID
         is_end = tokens == END_TOKEN_ID
@@ -204,6 +221,149 @@ def _derive_initial_state_from_prompt(
     return next_x, next_y, in_output
 
 
+def _grid_shape(grid: list[list[int]] | None) -> tuple[int, int] | None:
+    if not grid or not grid[0]:
+        return None
+    row_len = len(grid[0])
+    if row_len == 0:
+        return None
+    for row in grid:
+        if len(row) != row_len:
+            return None
+    return len(grid), row_len
+
+
+def _infer_output_shape(task: dict) -> tuple[int, int] | None:
+    shapes: list[tuple[int, int]] = []
+    for pair in task.get("train", []):
+        output_grid = pair.get("output")
+        shape = _grid_shape(output_grid)
+        if shape is None:
+            return None
+        shapes.append(shape)
+    if not shapes:
+        return None
+    first = shapes[0]
+    if all(s == first for s in shapes):
+        return first
+    return None
+
+
+def _collect_palette(
+    task: dict,
+    test_idx: int,
+    include_test_input: bool = False,
+) -> set[int]:
+    colors: set[int] = set()
+    for pair in task.get("train", []):
+        for key in ("input", "output"):
+            grid = pair.get(key)
+            if grid is None:
+                continue
+            for row in grid:
+                for val in row:
+                    colors.add(int(val))
+    if include_test_input and task.get("test"):
+        test_input = task["test"][test_idx]["input"]
+        for row in test_input:
+            for val in row:
+                colors.add(int(val))
+    return colors
+
+
+def _transform_shape(
+    shape: tuple[int, int] | None,
+    dihedral_idx: int,
+) -> tuple[int, int] | None:
+    if shape is None:
+        return None
+    if dihedral_idx in {1, 3, 6, 7}:
+        return shape[1], shape[0]
+    return shape
+
+
+def _apply_logit_constraints(
+    logits: torch.Tensor,
+    grid_state: GridStateUpdater,
+    constraints: DecodingConstraints | None,
+) -> torch.Tensor:
+    if constraints is None:
+        return logits
+
+    batch = logits.shape[0]
+
+    for tok in constraints.disallow_tokens:
+        logits[..., tok] = float("-inf")
+
+    palette_mask = constraints.palette_mask
+    if palette_mask is not None:
+        if palette_mask.device != logits.device:
+            palette_mask = palette_mask.to(device=logits.device)
+        if palette_mask.dim() != 2:
+            palette_mask = palette_mask.reshape(-1, palette_mask.shape[-1])
+        if palette_mask.shape[0] != batch:
+            if palette_mask.shape[0] == 1:
+                palette_mask = palette_mask.expand(batch, -1)
+            else:
+                palette_mask = None
+        if palette_mask is not None:
+            penalty = (~palette_mask).to(logits.dtype) * constraints.palette_penalty
+            logits[..., :10] = logits[..., :10] - penalty.unsqueeze(1)
+
+    target_shape = constraints.target_shape
+    if target_shape is not None:
+        if target_shape.device != logits.device:
+            target_shape = target_shape.to(device=logits.device)
+        if target_shape.dim() != 2:
+            target_shape = target_shape.reshape(-1, 2)
+        if target_shape.shape[0] != batch:
+            if target_shape.shape[0] == 1:
+                target_shape = target_shape.expand(batch, -1)
+            else:
+                target_shape = None
+        if target_shape is not None:
+            # Ensure target_shape is exactly 2D [batch, 2]
+            while target_shape.dim() > 2:
+                target_shape = target_shape.squeeze(-1)
+            if target_shape.dim() == 1:
+                target_shape = target_shape.unsqueeze(0)
+            # Extract and ensure 1D
+            target_h = target_shape[:, 0].contiguous().view(-1)
+            target_w = target_shape[:, 1].contiguous().view(-1)
+            has_shape = (target_h >= 0) & (target_w >= 0)
+            if has_shape.any():
+                x = grid_state.x.contiguous().view(-1)
+                y = grid_state.y.contiguous().view(-1)
+                # Align batch dimensions if needed
+                n_batch = x.shape[0]
+                n_constraint = target_w.shape[0]
+                if n_batch != n_constraint:
+                    if n_constraint == 1:
+                        target_h = target_h.expand(n_batch)
+                        target_w = target_w.expand(n_batch)
+                        has_shape = has_shape.expand(n_batch)
+                    else:
+                        # Skip constraint if batch sizes truly incompatible
+                        return logits
+                row_full = has_shape & (x >= target_w)
+                row_incomplete = has_shape & (x < target_w)
+                past_end = has_shape & (y >= target_h)
+
+                if row_full.any():
+                    # Shape: [batch, 1, 1] to broadcast with [batch, seq, vocab]
+                    penalty = row_full.to(logits.dtype)[:, None, None] * constraints.shape_penalty
+                    logits[..., :10] = logits[..., :10] - penalty
+                if row_incomplete.any():
+                    penalty = row_incomplete.to(logits.dtype)[:, None, None] * constraints.shape_penalty
+                    logits[..., NEWLINE_TOKEN_ID:NEWLINE_TOKEN_ID+1] = logits[..., NEWLINE_TOKEN_ID:NEWLINE_TOKEN_ID+1] - penalty
+                if past_end.any():
+                    penalty = past_end.to(logits.dtype)[:, None, None] * constraints.shape_penalty
+                    logits[..., :10] = logits[..., :10] - penalty
+                    logits[..., NEWLINE_TOKEN_ID:NEWLINE_TOKEN_ID+1] = logits[..., NEWLINE_TOKEN_ID:NEWLINE_TOKEN_ID+1] - penalty
+
+    return logits
+
+
 # =============================================================================
 # CORE DECODE FUNCTIONS
 # =============================================================================
@@ -230,7 +390,9 @@ def _prefill(model: TinyTransformer, input_ids: torch.Tensor, positions_3d: torc
     """
     batch_size, seq_len = input_ids.shape
 
-    x = model.token_embed(input_ids) + model.example_embed(example_ids).unsqueeze(1)
+    x = model.token_embed(input_ids)
+    if example_ids is not None and getattr(model.config, "use_example_embedding", True):
+        x = x + model.example_embed(example_ids).unsqueeze(1)
 
     # Convert attention mask to SDPA format if provided
     attn_mask = _build_sdpa_mask(attention_mask, x.dtype)
@@ -268,7 +430,9 @@ def _decode_step(model: TinyTransformer, token: torch.Tensor, position: torch.Te
     """Decode one token with cache. Returns logits."""
     batch_size = token.size(0)
 
-    x = model.token_embed(token) + model.example_embed(example_ids).unsqueeze(1)
+    x = model.token_embed(token)
+    if example_ids is not None and getattr(model.config, "use_example_embedding", True):
+        x = x + model.example_embed(example_ids).unsqueeze(1)
 
     for layer_idx, block in enumerate(model.blocks):
         x_norm = block.ln1(x)
@@ -328,8 +492,10 @@ def generate_output(
     attention_mask: torch.Tensor | None = None,
     max_new_tokens: int = 900,
     temperature: float = 0.0,
+    top_k: int | None = None,
     stop_on_end: bool = True,
     use_compile: bool = False,
+    constraints: DecodingConstraints | None = None,
 ) -> torch.Tensor:
     """
     Generate output tokens autoregressively with static KV cache.
@@ -342,8 +508,10 @@ def generate_output(
         attention_mask: [batch, seq_len] bool mask (True=valid, False=padding)
         max_new_tokens: Maximum tokens to generate
         temperature: Sampling temperature (0.0 = greedy)
+        top_k: If set and temperature > 0, sample from top-k logits
         stop_on_end: If True, stop when END token is generated
         use_compile: If True, use torch.compile for decode step
+        constraints: Optional decoding constraints
 
     Returns:
         Full sequence [batch, seq_len + generated_len] including prompt
@@ -401,10 +569,18 @@ def generate_output(
         )
 
     # Sample first token
+    logits = _apply_logit_constraints(logits, grid_state, constraints)
     if temperature <= 0:
         next_token = logits.argmax(dim=-1)
     else:
-        next_token = torch.multinomial(F.softmax(logits[:, 0, :] / temperature, dim=-1), 1)
+        logits_t = logits[:, 0, :] / max(temperature, 1e-6)
+        if top_k is not None and top_k > 0:
+            k = min(top_k, logits_t.size(-1))
+            top_vals, top_idx = torch.topk(logits_t, k, dim=-1)
+            probs = torch.zeros_like(logits_t).scatter_(1, top_idx, F.softmax(top_vals, dim=-1))
+        else:
+            probs = F.softmax(logits_t, dim=-1)
+        next_token = torch.multinomial(probs, 1)
 
     generated = [input_ids, next_token]
     finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -430,10 +606,18 @@ def generate_output(
                 attention_mask=full_attention_mask[:, : cache.seq_len + 1],
             )
 
+        logits = _apply_logit_constraints(logits, grid_state, constraints)
         if temperature <= 0:
             next_token = logits.argmax(dim=-1)
         else:
-            next_token = torch.multinomial(F.softmax(logits[:, 0, :] / temperature, dim=-1), 1)
+            logits_t = logits[:, 0, :] / max(temperature, 1e-6)
+            if top_k is not None and top_k > 0:
+                k = min(top_k, logits_t.size(-1))
+                top_vals, top_idx = torch.topk(logits_t, k, dim=-1)
+                probs = torch.zeros_like(logits_t).scatter_(1, top_idx, F.softmax(top_vals, dim=-1))
+            else:
+                probs = F.softmax(logits_t, dim=-1)
+            next_token = torch.multinomial(probs, 1)
 
         if stop_on_end:
             finished = finished | (next_token.squeeze(-1) == END_TOKEN_ID)
@@ -452,7 +636,10 @@ def predict_grid(
     device: torch.device,
     example_id: int = 0,
     max_output_tokens: int = 900,
+    temperature: float = 0.0,
+    top_k: int | None = None,
     use_compile: bool = False,
+    constraints: DecodingConstraints | None = None,
 ) -> list[list[int]] | None:
     """
     Predict the output grid for a test input given training examples.
@@ -465,7 +652,10 @@ def predict_grid(
         device: Device to run on
         example_id: Task example ID for conditioning
         max_output_tokens: Maximum output tokens to generate
+        temperature: Sampling temperature (0.0 = greedy)
+        top_k: If set and temperature > 0, sample from top-k logits
         use_compile: If True, use torch.compile
+        constraints: Optional decoding constraints
 
     Returns:
         Predicted output grid, or None if decoding fails
@@ -487,8 +677,12 @@ def predict_grid(
     with torch.no_grad():
         output_ids = generate_output(
             model, input_ids, positions_3d, example_ids,
-            max_new_tokens=max_output_tokens, temperature=0.0,
-            stop_on_end=True, use_compile=use_compile,
+            max_new_tokens=max_output_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            stop_on_end=True,
+            use_compile=use_compile,
+            constraints=constraints,
         )
 
     tokens_list = output_ids[0].cpu().tolist()
@@ -506,8 +700,15 @@ def predict_with_augmentations(
     test_idx: int,
     device: torch.device,
     example_id: int = 0,
+    use_train_examples: bool = True,
     num_color_perms: int = 8,
     max_output_tokens: int = 900,
+    num_samples: int = 1,
+    sample_temperature: float = 0.0,
+    sample_top_k: int | None = None,
+    constrain_decoding: bool = False,
+    palette_penalty: float = 2.0,
+    shape_penalty: float = 2.0,
     batched: bool = True,
     use_compile: bool = False,
 ) -> list[tuple[list[list[int]] | None, int, tuple[int, ...] | None]]:
@@ -520,23 +721,42 @@ def predict_with_augmentations(
         test_idx: Which test example to predict
         device: Device to run on
         example_id: Task example ID for conditioning
+        use_train_examples: If False, prompt uses only the test input
         num_color_perms: Number of color permutations
         max_output_tokens: Maximum tokens per prediction
+        num_samples: Number of samples per augmentation (self-consistency)
+        sample_temperature: Sampling temperature for self-consistency
+        sample_top_k: If set and temperature > 0, sample from top-k logits
+        constrain_decoding: If True, apply soft palette/shape constraints
+        palette_penalty: Logit penalty for disallowed colors
+        shape_penalty: Logit penalty for shape rule violations
         batched: If True, process all augmentations in one batched pass (faster)
         use_compile: If True, use torch.compile
 
     Returns:
         List of (predicted_grid, dihedral_idx, color_perm_tuple) tuples.
     """
+    num_samples = max(1, num_samples)
+    base_palette = _collect_palette(task, test_idx) if constrain_decoding else None
+    base_shape = _infer_output_shape(task) if constrain_decoding else None
+
     if batched:
         return _predict_augmentations_batched(
             model, task, test_idx, device, example_id,
-            num_color_perms, max_output_tokens, use_compile,
+            use_train_examples, num_color_perms, max_output_tokens,
+            num_samples, sample_temperature, sample_top_k,
+            constrain_decoding, base_palette, base_shape,
+            palette_penalty, shape_penalty,
+            use_compile,
         )
     else:
         return _predict_augmentations_sequential(
             model, task, test_idx, device, example_id,
-            num_color_perms, max_output_tokens, use_compile,
+            use_train_examples, num_color_perms, max_output_tokens,
+            num_samples, sample_temperature, sample_top_k,
+            constrain_decoding, base_palette, base_shape,
+            palette_penalty, shape_penalty,
+            use_compile,
         )
 
 
@@ -546,28 +766,46 @@ def _predict_augmentations_batched(
     test_idx: int,
     device: torch.device,
     example_id: int,
+    use_train_examples: bool,
     num_color_perms: int,
     max_output_tokens: int,
+    num_samples: int,
+    sample_temperature: float,
+    sample_top_k: int | None,
+    constrain_decoding: bool,
+    base_palette: set[int] | None,
+    base_shape: tuple[int, int] | None,
+    palette_penalty: float,
+    shape_penalty: float,
     use_compile: bool,
+    max_batch_size: int = 16,  # Process augmentations in chunks to avoid OOM
 ) -> list[tuple[list[list[int]] | None, int, tuple[int, ...] | None]]:
-    """Batched augmentation prediction - all augmentations in one pass."""
+    """Batched augmentation prediction - processes in chunks to manage memory."""
     model.eval()
 
-    train_pairs = task["train"]
+    train_pairs = task["train"] if use_train_examples else []
     test_input = task["test"][test_idx]["input"]
     color_perms = generate_color_permutations(num_color_perms, seed=42)
 
     # Build all augmented prompts
     prompts, positions_list, aug_info = [], [], []
+    palettes, shapes = [], []
 
     for dihedral_idx, dihedral_fn in enumerate(DIHEDRAL_TRANSFORMS):
         aug_inputs = [dihedral_fn(p["input"]) for p in train_pairs]
         aug_outputs = [dihedral_fn(p["output"]) for p in train_pairs]
         aug_test = dihedral_fn(test_input)
+        shape = _transform_shape(base_shape, dihedral_idx) if constrain_decoding else None
 
         for perm_idx in range(num_color_perms):
             perm = color_perms[perm_idx]
             perm_tuple = tuple(perm.tolist()) if perm_idx > 0 else None
+            palette = None
+            if base_palette is not None:
+                if perm_idx > 0:
+                    palette = {int(perm[c]) for c in base_palette}
+                else:
+                    palette = base_palette
 
             if perm_idx > 0:
                 p_inputs = [_apply_color_perm_grid(g, perm) for g in aug_inputs]
@@ -581,51 +819,105 @@ def _predict_augmentations_batched(
                 tokens.extend(encode_example(inp, out))
             tokens.extend(encode_example(p_test, None))
 
-            prompts.append(tokens)
-            positions_list.append(compute_positions_3d(tokens).tolist())
-            aug_info.append((dihedral_idx, perm_tuple))
+            for _ in range(num_samples):
+                prompts.append(tokens)
+                positions_list.append(compute_positions_3d(tokens).tolist())
+                aug_info.append((dihedral_idx, perm_tuple))
+                palettes.append(palette)
+                shapes.append(shape)
 
-    # Left-pad and batch (upstream uses left-padding with attention mask)
-    max_len = max(len(p) for p in prompts)
+    # Process in chunks to avoid OOM
+    all_predictions = []
     total = len(prompts)
-    seq_lens = [len(p) for p in prompts]
 
-    # Left-pad: prepend padding tokens
-    padded_ids = [([END_TOKEN_ID] * (max_len - len(p))) + p for p in prompts]
-    padded_pos = [([[0, 0, 0]] * (max_len - len(p))) + p for p in positions_list]
+    for chunk_start in range(0, total, max_batch_size):
+        chunk_end = min(chunk_start + max_batch_size, total)
+        chunk_prompts = prompts[chunk_start:chunk_end]
+        chunk_positions = positions_list[chunk_start:chunk_end]
+        chunk_aug_info = aug_info[chunk_start:chunk_end]
+        chunk_size = len(chunk_prompts)
+        chunk_palettes = palettes[chunk_start:chunk_end]
+        chunk_shapes = shapes[chunk_start:chunk_end]
 
-    # Create attention mask: True for real tokens, False for padding
-    attention_mask = torch.zeros(total, max_len, dtype=torch.bool, device=device)
-    for i, seq_len in enumerate(seq_lens):
-        attention_mask[i, max_len - seq_len:] = True
+        constraints = None
+        if constrain_decoding:
+            palette_mask = None
+            if chunk_palettes:
+                mask = torch.ones((chunk_size, 10), dtype=torch.bool, device=device)
+                any_palette = False
+                for i, palette in enumerate(chunk_palettes):
+                    if palette:
+                        any_palette = True
+                        mask[i].fill_(False)
+                        for c in palette:
+                            if 0 <= c < 10:
+                                mask[i, c] = True
+                if any_palette:
+                    palette_mask = mask
 
-    input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
-    positions_3d = torch.tensor(padded_pos, dtype=torch.long, device=device)
-    example_ids = torch.full((total,), example_id, dtype=torch.long, device=device)
+            target_shape = None
+            if chunk_shapes:
+                shape_tensor = torch.full((chunk_size, 2), -1, dtype=torch.long, device=device)
+                any_shape = False
+                for i, shape in enumerate(chunk_shapes):
+                    if shape is not None:
+                        any_shape = True
+                        shape_tensor[i, 0] = shape[0]
+                        shape_tensor[i, 1] = shape[1]
+                if any_shape:
+                    target_shape = shape_tensor
 
-    # Generate all at once
-    with torch.no_grad():
-        output_ids = generate_output(
-            model, input_ids, positions_3d, example_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_output_tokens, temperature=0.0,
-            stop_on_end=True, use_compile=use_compile,
-        )
+            constraints = DecodingConstraints(
+                palette_mask=palette_mask,
+                target_shape=target_shape,
+                palette_penalty=palette_penalty,
+                shape_penalty=shape_penalty,
+            )
 
-    # Decode each
-    predictions = []
-    for i in range(total):
-        tokens_list = output_ids[i].cpu().tolist()
-        sep_positions = [j for j, t in enumerate(tokens_list) if t == IO_SEP_TOKEN_ID]
+        # Left-pad this chunk
+        max_len = max(len(p) for p in chunk_prompts)
+        seq_lens = [len(p) for p in chunk_prompts]
 
-        if sep_positions:
-            grid = decode_output_grid(tokens_list[sep_positions[-1]:])
-        else:
-            grid = None
+        padded_ids = [([END_TOKEN_ID] * (max_len - len(p))) + p for p in chunk_prompts]
+        padded_pos = [([[0, 0, 0]] * (max_len - len(p))) + p for p in chunk_positions]
 
-        predictions.append((grid, aug_info[i][0], aug_info[i][1]))
+        attention_mask = torch.zeros(chunk_size, max_len, dtype=torch.bool, device=device)
+        for i, seq_len in enumerate(seq_lens):
+            attention_mask[i, max_len - seq_len:] = True
 
-    return predictions
+        input_ids = torch.tensor(padded_ids, dtype=torch.long, device=device)
+        positions_3d = torch.tensor(padded_pos, dtype=torch.long, device=device)
+        example_ids_t = torch.full((chunk_size,), example_id, dtype=torch.long, device=device)
+
+        # Generate for this chunk
+        with torch.no_grad():
+            output_ids = generate_output(
+                model, input_ids, positions_3d, example_ids_t,
+                attention_mask=attention_mask,
+                max_new_tokens=max_output_tokens,
+                temperature=sample_temperature,
+                top_k=sample_top_k,
+                stop_on_end=True,
+                use_compile=use_compile,
+                constraints=constraints,
+            )
+
+        # Decode each in chunk
+        for i in range(chunk_size):
+            tokens_list = output_ids[i].cpu().tolist()
+            sep_positions = [j for j, t in enumerate(tokens_list) if t == IO_SEP_TOKEN_ID]
+
+            if sep_positions:
+                grid = decode_output_grid(tokens_list[sep_positions[-1]:])
+            else:
+                grid = None
+
+            all_predictions.append((grid, chunk_aug_info[i][0], chunk_aug_info[i][1]))
+
+        # Free memory
+        del input_ids, positions_3d, example_ids_t, attention_mask, output_ids
+
+    return all_predictions
 
 
 def _predict_augmentations_sequential(
@@ -634,14 +926,23 @@ def _predict_augmentations_sequential(
     test_idx: int,
     device: torch.device,
     example_id: int,
+    use_train_examples: bool,
     num_color_perms: int,
     max_output_tokens: int,
+    num_samples: int,
+    sample_temperature: float,
+    sample_top_k: int | None,
+    constrain_decoding: bool,
+    base_palette: set[int] | None,
+    base_shape: tuple[int, int] | None,
+    palette_penalty: float,
+    shape_penalty: float,
     use_compile: bool,
 ) -> list[tuple[list[list[int]] | None, int, tuple[int, ...] | None]]:
     """Sequential augmentation prediction - one at a time (lower memory)."""
     model.eval()
 
-    train_pairs = task["train"]
+    train_pairs = task["train"] if use_train_examples else []
     test_input = task["test"][test_idx]["input"]
     color_perms = generate_color_permutations(num_color_perms, seed=42)
     predictions = []
@@ -650,10 +951,17 @@ def _predict_augmentations_sequential(
         aug_inputs = [dihedral_fn(p["input"]) for p in train_pairs]
         aug_outputs = [dihedral_fn(p["output"]) for p in train_pairs]
         aug_test = dihedral_fn(test_input)
+        shape = _transform_shape(base_shape, dihedral_idx) if constrain_decoding else None
 
         for perm_idx in range(num_color_perms):
             perm = color_perms[perm_idx]
             perm_tuple = tuple(perm.tolist()) if perm_idx > 0 else None
+            palette = None
+            if base_palette is not None:
+                if perm_idx > 0:
+                    palette = {int(perm[c]) for c in base_palette}
+                else:
+                    palette = base_palette
 
             if perm_idx > 0:
                 p_inputs = [_apply_color_perm_grid(g, perm) for g in aug_inputs]
@@ -662,12 +970,35 @@ def _predict_augmentations_sequential(
             else:
                 p_inputs, p_outputs, p_test = aug_inputs, aug_outputs, aug_test
 
-            pred = predict_grid(
-                model, p_inputs, p_outputs, p_test, device,
-                example_id=example_id, max_output_tokens=max_output_tokens,
-                use_compile=use_compile,
-            )
-            predictions.append((pred, dihedral_idx, perm_tuple))
+            constraints = None
+            if constrain_decoding:
+                palette_mask = None
+                if palette:
+                    mask = torch.zeros((1, 10), dtype=torch.bool, device=device)
+                    for c in palette:
+                        if 0 <= c < 10:
+                            mask[0, c] = True
+                    palette_mask = mask
+
+                target_shape = None
+                if shape is not None:
+                    target_shape = torch.tensor([[shape[0], shape[1]]], dtype=torch.long, device=device)
+
+                constraints = DecodingConstraints(
+                    palette_mask=palette_mask,
+                    target_shape=target_shape,
+                    palette_penalty=palette_penalty,
+                    shape_penalty=shape_penalty,
+                )
+
+            for _ in range(num_samples):
+                pred = predict_grid(
+                    model, p_inputs, p_outputs, p_test, device,
+                    example_id=example_id, max_output_tokens=max_output_tokens,
+                    temperature=sample_temperature, top_k=sample_top_k,
+                    use_compile=use_compile, constraints=constraints,
+                )
+                predictions.append((pred, dihedral_idx, perm_tuple))
 
     return predictions
 

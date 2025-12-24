@@ -1,0 +1,289 @@
+[
+  {
+    "name": "baseline",
+    "description": "Full mdlARC system (control)",
+    "overrides": {},
+    "returncode": 0,
+    "duration_seconds": 391.556374,
+    "metrics": {
+      "loss": 0.3687705166082199,
+      "input_loss": 0.4621807617561531,
+      "output_loss": 0.22393212422610043,
+      "accuracy": 0.5965790433093098,
+      "ema_loss": 0.3570814844237609,
+      "ema_output_loss": 0.22395502164605668,
+      "ema_accuracy": 0.5997058530961058,
+      "tokens_per_sec": 69126.90818721059,
+      "epoch_time": 76.91803581899148,
+      "mfu": 3.110773870163584,
+      "val_loss": 0.3636578497062359,
+      "val_input_loss": 0.39389332406280647,
+      "val_output_loss": 0.295880750971789,
+      "val_accuracy": 0.6051624926436932
+    }
+  },
+  {
+    "name": "gelu",
+    "description": "Swap SwiGLU for GELU FFN",
+    "overrides": {
+      "ffn_type": "gelu"
+    },
+    "returncode": 0,
+    "duration_seconds": 353.830704,
+    "metrics": {
+      "loss": 0.3901808832430794,
+      "input_loss": 0.4858998875542805,
+      "output_loss": 0.2407718511882802,
+      "accuracy": 0.6000190218960463,
+      "ema_loss": 0.3971110546028257,
+      "ema_output_loss": 0.23879789895498743,
+      "ema_accuracy": 0.5967785944702976,
+      "tokens_per_sec": 76883.28854941393,
+      "epoch_time": 69.36260272702202,
+      "mfu": 2.7554970616109955,
+      "val_loss": 0.38482511348581827,
+      "val_input_loss": 0.4153243347498539,
+      "val_output_loss": 0.3126984125862017,
+      "val_accuracy": 0.6029229059046622
+    }
+  },
+  {
+    "name": "layernorm",
+    "description": "Swap RMSNorm for LayerNorm",
+    "overrides": {
+      "norm_type": "layernorm"
+    },
+    "returncode": 0,
+    "duration_seconds": 340.320618,
+    "metrics": {
+      "loss": 0.36859598617489936,
+      "input_loss": 0.46313638395590606,
+      "output_loss": 0.2218625177572806,
+      "accuracy": 0.595756674486898,
+      "ema_loss": 0.3562501973638803,
+      "ema_output_loss": 0.2211026913635255,
+      "ema_accuracy": 0.5984974038318005,
+      "tokens_per_sec": 79766.97720831945,
+      "epoch_time": 66.6579853729927,
+      "mfu": 3.591913041942058,
+      "val_loss": 0.364644630564707,
+      "val_input_loss": 0.3951453893053501,
+      "val_output_loss": 0.29401032401471855,
+      "val_accuracy": 0.6040345255999476
+    }
+  },
+  {
+    "name": "no_aug",
+    "description": "No augmentation at all",
+    "overrides": {
+      "no_apply_dihedral": true,
+      "num_color_perms": 0
+    },
+    "returncode": 0,
+    "duration_seconds": 53.001295,
+    "metrics": {
+      "loss": 0.6234818012139982,
+      "input_loss": 0.6577909828635385,
+      "output_loss": 0.5708780358989212,
+      "accuracy": 0.6260733256507856,
+      "ema_loss": 0.5919540101352492,
+      "ema_output_loss": 0.559641013754592,
+      "ema_accuracy": 0.6351860628005219,
+      "tokens_per_sec": 72793.42224827237,
+      "epoch_time": 9.187189987016609,
+      "mfu": 3.275770344544432,
+      "val_loss": 0.5813947215548899,
+      "val_input_loss": 0.5816468192829628,
+      "val_output_loss": 0.6294352650096933,
+      "val_accuracy": 0.6140881449028968
+    }
+  },
+  {
+    "name": "no_color",
+    "description": "Disable color permutation augmentation",
+    "overrides": {
+      "num_color_perms": 0
+    },
+    "returncode": 0,
+    "duration_seconds": 390.762959,
+    "metrics": {
+      "loss": 0.33854384878019045,
+      "input_loss": 0.4337422790060552,
+      "output_loss": 0.18993816644059122,
+      "accuracy": 0.5955385149239198,
+      "ema_loss": 0.3285276859998566,
+      "ema_output_loss": 0.19230615823672098,
+      "ema_accuracy": 0.5983920249764669,
+      "tokens_per_sec": 69273.36862489599,
+      "epoch_time": 76.75541272998089,
+      "mfu": 3.117364723342358,
+      "val_loss": 0.34700608524768434,
+      "val_input_loss": 0.3785689027953104,
+      "val_output_loss": 0.26491573331487195,
+      "val_accuracy": 0.6040508729484078
+    }
+  },
+  {
+    "name": "no_concept",
+    "description": "Train on ARC-1 only (no ConceptARC)",
+    "overrides": {
+      "no_concept": true,
+      "data_path": "data/arc1_training_challenges.json",
+      "solutions_path": "data/arc1_training_solutions.json"
+    },
+    "returncode": 0,
+    "duration_seconds": 335.547041,
+    "metrics": {
+      "loss": 0.40037436210888416,
+      "input_loss": 0.5055306924887957,
+      "output_loss": 0.24778043623046073,
+      "accuracy": 0.5927258497899982,
+      "ema_loss": 0.39116844267477274,
+      "ema_output_loss": 0.2511148050762093,
+      "ema_accuracy": 0.5933389168879607,
+      "tokens_per_sec": 72812.59119900521,
+      "epoch_time": 65.2531783550221,
+      "mfu": 3.2766329647978463,
+      "val_loss": 0.3852414992745861,
+      "val_input_loss": 0.42587033622113113,
+      "val_output_loss": 0.2851460352137035,
+      "val_accuracy": 0.6054567449159747
+    }
+  },
+  {
+    "name": "no_dihedral",
+    "description": "Disable dihedral (geometric) augmentation",
+    "overrides": {
+      "no_apply_dihedral": true
+    },
+    "returncode": 0,
+    "duration_seconds": 53.586256,
+    "metrics": {
+      "loss": 0.656048997027058,
+      "input_loss": 0.6846010477617223,
+      "output_loss": 0.6127536602290135,
+      "accuracy": 0.6406585262700454,
+      "ema_loss": 0.6207885969405748,
+      "ema_output_loss": 0.5987403240787311,
+      "ema_accuracy": 0.6473819353402415,
+      "tokens_per_sec": 72597.58816826614,
+      "epoch_time": 9.211972695979057,
+      "mfu": 3.266957632462459,
+      "val_loss": 0.5968584724925573,
+      "val_input_loss": 0.5936896229863703,
+      "val_output_loss": 0.6583943817582494,
+      "val_accuracy": 0.6251062577649905
+    }
+  },
+  {
+    "name": "no_example_embedding",
+    "description": "Disable example embeddings",
+    "overrides": {
+      "no_example_embedding": true
+    },
+    "returncode": 1,
+    "duration_seconds": 5.559159,
+    "metrics": {}
+  },
+  {
+    "name": "output_only_loss",
+    "description": "Only compute loss on output tokens",
+    "overrides": {
+      "input_loss_weight": 0.0,
+      "uniform_loss_weight": false
+    },
+    "returncode": 0,
+    "duration_seconds": 391.376684,
+    "metrics": {
+      "loss": 0.2082301409600523,
+      "input_loss": 1.5987138787593096,
+      "output_loss": 0.2082301409600523,
+      "accuracy": 0.5957400806946357,
+      "ema_loss": 0.20478935588752664,
+      "ema_output_loss": 0.20478935588752664,
+      "ema_accuracy": 0.5986364838373304,
+      "tokens_per_sec": 69120.61418659585,
+      "epoch_time": 76.92503983899951,
+      "mfu": 3.1104906343996164,
+      "val_loss": 0.23704129455602987,
+      "val_input_loss": 1.59790346600238,
+      "val_output_loss": 0.23704129455602987,
+      "val_accuracy": 0.603282547570784
+    }
+  },
+  {
+    "name": "rope_1d",
+    "description": "1D RoPE over sequence positions",
+    "overrides": {
+      "rope_type": "1d"
+    },
+    "returncode": 0,
+    "duration_seconds": 390.372594,
+    "metrics": {
+      "loss": 0.5287118814028067,
+      "input_loss": 0.5254460433207151,
+      "output_loss": 0.5329591993772509,
+      "accuracy": 0.6320121583692011,
+      "ema_loss": 0.509356583373095,
+      "ema_output_loss": 0.5123648804394336,
+      "ema_accuracy": 0.6334806834273494,
+      "tokens_per_sec": 69291.97839300425,
+      "epoch_time": 76.73479850500007,
+      "mfu": 3.118202179868031,
+      "val_loss": 0.4650905764915773,
+      "val_input_loss": 0.4564605960720896,
+      "val_output_loss": 0.5208296431444374,
+      "val_accuracy": 0.6268554240502191
+    }
+  },
+  {
+    "name": "rope_none",
+    "description": "No RoPE positional encoding",
+    "overrides": {
+      "rope_type": "none"
+    },
+    "returncode": 0,
+    "duration_seconds": 341.32237,
+    "metrics": {
+      "loss": 0.840891049347409,
+      "input_loss": 0.8026864407477955,
+      "output_loss": 0.8980874890020772,
+      "accuracy": 0.7470529405570601,
+      "ema_loss": 0.8355924616090243,
+      "ema_output_loss": 0.880530926782843,
+      "ema_accuracy": 0.7348090790102901,
+      "tokens_per_sec": 79765.06554779114,
+      "epoch_time": 66.85664912799257,
+      "mfu": 3.5895006469255306,
+      "val_loss": 0.735532989329361,
+      "val_input_loss": 0.7070463883994627,
+      "val_output_loss": 0.814158153661689,
+      "val_accuracy": 0.7440332178120709
+    }
+  },
+  {
+    "name": "train_split_only",
+    "description": "Train only on train split pairs (no test-pair outputs)",
+    "overrides": {
+      "train_split_only": true
+    },
+    "returncode": 0,
+    "duration_seconds": 299.300219,
+    "metrics": {
+      "loss": 0.39577343305366824,
+      "input_loss": 0.5170601909507213,
+      "output_loss": 0.24348934493412647,
+      "accuracy": 0.6016194691209727,
+      "ema_loss": 0.39689363346196005,
+      "ema_output_loss": 0.24270213023101928,
+      "ema_accuracy": 0.5939709237721632,
+      "tokens_per_sec": 67623.88403292959,
+      "epoch_time": 59.29632787799346,
+      "mfu": 3.0431364133761405,
+      "val_loss": 0.4510466990110407,
+      "val_input_loss": 0.47966128653250995,
+      "val_output_loss": 0.4007552210335153,
+      "val_accuracy": 0.6046720721898908
+    }
+  }
+]

@@ -138,6 +138,8 @@ class TestEvaluateTask:
         assert "test_outputs" in result
         assert "correct_at_1" in result
         assert "correct_at_2" in result
+        assert "fractional_at_1" in result
+        assert "fractional_at_2" in result
         assert "voting_stats" in result
 
     def test_correct_number_of_outputs(self, model, device, simple_task):
@@ -215,6 +217,8 @@ class TestEvaluateDataset:
         assert "correct_at_2" in result
         assert "accuracy_at_1" in result
         assert "accuracy_at_2" in result
+        assert "arc_score_at_1" in result
+        assert "arc_score_at_2" in result
         assert "per_task_results" in result
 
     def test_counts_all_tasks(self, model, device, simple_challenges):
