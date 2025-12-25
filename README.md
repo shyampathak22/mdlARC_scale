@@ -264,7 +264,7 @@ If you use this code in your research, please cite the original mdlARC work:
 @misc{vadke2024mdlarc,
   author = {Vadke, Mithil},
   title = {mdlARC: MDL Principles for ARC-AGI},
-  year = {2024},
+  year = {2025},
   publisher = {GitHub},
   url = {https://github.com/mvakde/mdlARC}
 }
@@ -276,3 +276,4 @@ If you use this code in your research, please cite the original mdlARC work:
 - [Original mdlARC](https://github.com/mvakde/mdlARC) - Mithil Vadke's implementation
 - [ARC-AGI Dataset](https://github.com/fchollet/ARC-AGI) - Francois Chollet's dataset repository
 - [ConceptARC](https://github.com/victorvikram/ConceptARC) - Extended ARC dataset
+
