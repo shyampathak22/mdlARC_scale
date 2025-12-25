@@ -21,7 +21,7 @@ def compute_refinement_loss(
     output_mask: torch.Tensor | None = None,
     weighting: Literal["uniform", "linear", "exponential"] = "linear",
     output_only: bool = False,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+) -> dict[str, torch.Tensor]:
     """
     Compute deep supervision loss over refinement steps.
 
@@ -37,8 +37,7 @@ def compute_refinement_loss(
         output_only: If True, only compute loss on output tokens
 
     Returns:
-        total_loss: Weighted sum of per-step losses
-        loss_dict: Dictionary with per-step losses for logging
+        Dict with 'loss', 'input_loss', 'output_loss' and per-step losses
     """
     K = len(all_logits)
     device = all_logits[0].device
@@ -71,10 +70,20 @@ def compute_refinement_loss(
         token_mask = token_mask * output_mask.float()
 
     # Shift for next-token prediction: logits[:, :-1] predicts labels[:, 1:]
-    shift_mask = token_mask[:, 1:]  # [B, S-1]
-    shift_labels = labels[:, 1:]    # [B, S-1]
+    shift_mask = token_mask[:, 1:].contiguous()  # [B, S-1]
+    shift_labels = labels[:, 1:].contiguous()    # [B, S-1]
+
+    # Also create separate input/output masks for tracking
+    if output_mask is not None:
+        shift_output_mask = output_mask[:, 1:].contiguous().float()
+        shift_input_mask = (1.0 - shift_output_mask) * (attention_mask[:, 1:].float() if attention_mask is not None else 1.0)
+    else:
+        shift_output_mask = None
+        shift_input_mask = None
 
     total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+    total_input_loss = torch.tensor(0.0, device=device, dtype=dtype)
+    total_output_loss = torch.tensor(0.0, device=device, dtype=dtype)
     loss_dict = {}
 
     for k, logits in enumerate(all_logits):
@@ -82,22 +91,33 @@ def compute_refinement_loss(
 
         # Compute per-token loss
         vocab_size = shift_logits.size(-1)
-        flat_logits = shift_logits.view(-1, vocab_size)
-        flat_labels = shift_labels.view(-1)
+        flat_logits = shift_logits.reshape(-1, vocab_size)
+        flat_labels = shift_labels.reshape(-1)
         per_token_loss = F.cross_entropy(flat_logits, flat_labels, reduction='none')
-        per_token_loss = per_token_loss.view_as(shift_labels)
+        per_token_loss = per_token_loss.reshape(shift_labels.shape)
 
         # Apply mask and compute mean
         masked_loss = per_token_loss * shift_mask
         step_loss = masked_loss.sum() / shift_mask.sum().clamp(min=1)
 
+        # Track input/output losses separately using final step logits
+        if k == K - 1 and shift_output_mask is not None:
+            output_tokens = shift_output_mask.sum().clamp(min=1)
+            input_tokens = shift_input_mask.sum().clamp(min=1)
+            total_output_loss = (per_token_loss * shift_output_mask).sum() / output_tokens
+            total_input_loss = (per_token_loss * shift_input_mask).sum() / input_tokens
+
         # Accumulate weighted loss
         total_loss = total_loss + weights[k] * step_loss
         loss_dict[f"loss_step_{k}"] = step_loss.detach()
 
-    loss_dict["loss_total"] = total_loss.detach()
-
-    return total_loss, loss_dict
+    # Return dict compatible with train.py expectations
+    return {
+        "loss": total_loss,
+        "input_loss": total_input_loss,
+        "output_loss": total_output_loss,
+        **loss_dict,
+    }
 
 
 @dataclass

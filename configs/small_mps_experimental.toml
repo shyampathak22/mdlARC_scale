@@ -87,4 +87,4 @@ refinement_output_only = false        # If true, only compute loss on output tok
 seed = 42
 # M-series chip FP16 performance (adjust for your chip)
 # M1: ~5.5, M2: ~7.0, M3: ~10.0, M4: ~14.0
-peak_tflops = 10.0
+peak_tflops = 14.0
