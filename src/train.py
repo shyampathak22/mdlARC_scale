@@ -645,6 +645,11 @@ def train_one_epoch(
     """
     model.train()
 
+    # Get raw model for custom methods (unwrap DDP/compile if needed)
+    raw_model = model.module if hasattr(model, 'module') else model
+    if hasattr(raw_model, '_orig_mod'):  # torch.compile wrapper
+        raw_model = raw_model._orig_mod
+
     total_loss = 0.0
     total_input_loss = 0.0
     total_output_loss = 0.0
@@ -745,7 +750,7 @@ def train_one_epoch(
 
                 if use_refinement:
                     # Refinement loop training: K forward passes with deep supervision
-                    all_logits = model.forward_with_refinement(
+                    all_logits = raw_model.forward_with_refinement(
                         input_ids, positions_3d,
                         example_ids=example_ids,
                         attention_mask=attention_mask,
@@ -754,11 +759,12 @@ def train_one_epoch(
                     logits = all_logits[-1]
 
                     # Compute refinement loss with deep supervision
+                    # Always pass output_mask for tracking metrics
                     losses = compute_refinement_loss(
                         all_logits=all_logits,
                         labels=input_ids,
                         attention_mask=attention_mask,
-                        output_mask=output_mask if config.refinement_output_only else None,
+                        output_mask=output_mask,  # Always pass for tracking
                         weighting=config.refinement_loss_weighting,
                         output_only=config.refinement_output_only,
                     )
@@ -951,6 +957,11 @@ def validate(
     """
     model.eval()
 
+    # Get raw model for custom methods (unwrap DDP/compile if needed)
+    raw_model = model.module if hasattr(model, 'module') else model
+    if hasattr(raw_model, '_orig_mod'):  # torch.compile wrapper
+        raw_model = raw_model._orig_mod
+
     total_loss = 0.0
     total_input_loss = 0.0
     total_output_loss = 0.0
@@ -976,18 +987,19 @@ def validate(
 
             if use_refinement:
                 # Refinement loop: use final logits for validation
-                all_logits = model.forward_with_refinement(
+                all_logits = raw_model.forward_with_refinement(
                     input_ids, positions_3d,
                     example_ids=example_ids,
                     attention_mask=attention_mask,
                 )
                 logits = all_logits[-1]
 
+                # Always pass output_mask for tracking metrics
                 losses = compute_refinement_loss(
                     all_logits=all_logits,
                     labels=input_ids,
                     attention_mask=attention_mask,
-                    output_mask=output_mask if config.refinement_output_only else None,
+                    output_mask=output_mask,  # Always pass for tracking
                     weighting=config.refinement_loss_weighting,
                     output_only=config.refinement_output_only,
                 )

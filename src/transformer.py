@@ -13,6 +13,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Try to import fused Triton kernel for relative position bias
+try:
+    from .triton_kernels import fused_attention_with_rpb, FusedAttentionWithRPB
+    TRITON_AVAILABLE = True
+except ImportError:
+    try:
+        from triton_kernels import fused_attention_with_rpb, FusedAttentionWithRPB
+        TRITON_AVAILABLE = True
+    except ImportError:
+        TRITON_AVAILABLE = False
+
 
 def compute_refinement_loss(
     all_logits: list[torch.Tensor],
@@ -144,6 +155,7 @@ class TransformerConfig:
     use_relative_bias: bool = False  # Add learnable relative position bias to attention
     max_relative_dist_xy: int = 30   # Maximum relative distance for x/y bias table
     max_relative_dist_z: int = 8     # Maximum relative distance for z (semantic layer) bias table
+    use_fused_rpb_kernel: bool = True  # Use fused Triton kernel for RPB (much faster)
     # New: Edge and grid size encoding
     use_edge_encoding: bool = False  # Add per-token edge distance features
     use_grid_size_encoding: bool = False  # Add global grid size embedding
@@ -362,6 +374,9 @@ class RelativePositionBias3D(nn.Module):
     The z dimension captures semantic layer distances:
     - z_diff=0: same region (input→input or output→output)
     - z_diff=2: input↔output (the key transformation relationship)
+
+    Memory-efficient implementation: indices are precomputed once per forward
+    pass and reused across all attention layers.
     """
 
     def __init__(self, max_dist_xy: int, max_dist_z: int, n_heads: int):
@@ -384,36 +399,65 @@ class RelativePositionBias3D(nn.Module):
         nn.init.normal_(self.bias_y.weight, std=0.02)
         nn.init.normal_(self.bias_z.weight, std=0.02)
 
-    def forward(self, pos_xyz: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def compute_indices(
+        pos_xyz: torch.Tensor,
+        max_dist_xy: int,
+        max_dist_z: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Precompute relative position indices (call once, reuse across layers).
+
+        Args:
+            pos_xyz: [batch, seq, 3] position coordinates (x, y, z)
+            max_dist_xy: Maximum distance for x/y clamping
+            max_dist_z: Maximum distance for z clamping
+
+        Returns:
+            Tuple of (dx_idx, dy_idx, dz_idx), each [batch, seq, seq] int16
+        """
+        x = pos_xyz[..., 0]  # [B, S]
+        y = pos_xyz[..., 1]  # [B, S]
+        z = pos_xyz[..., 2]  # [B, S]
+
+        # Compute pairwise relative distances and clamp to valid range
+        # Using int16 to save memory (max value is 2*30+1=61, fits in int16)
+        dx = (x.unsqueeze(-1) - x.unsqueeze(-2)).clamp(-max_dist_xy, max_dist_xy) + max_dist_xy
+        dy = (y.unsqueeze(-1) - y.unsqueeze(-2)).clamp(-max_dist_xy, max_dist_xy) + max_dist_xy
+        dz = (z.unsqueeze(-1) - z.unsqueeze(-2)).clamp(-max_dist_z, max_dist_z) + max_dist_z
+
+        return dx.to(torch.int16), dy.to(torch.int16), dz.to(torch.int16)
+
+    def forward(
+        self,
+        pos_xyz: torch.Tensor | None = None,
+        precomputed_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """
         Compute 3D relative position bias for attention.
 
         Args:
             pos_xyz: [batch, seq, 3] position coordinates (x, y, z)
+                     Only used if precomputed_indices is None.
+            precomputed_indices: Tuple of (dx_idx, dy_idx, dz_idx) from compute_indices.
+                                 If provided, pos_xyz is ignored.
 
         Returns:
             bias: [batch, n_heads, seq, seq] attention bias
         """
-        # Extract x, y, z positions
-        x = pos_xyz[..., 0]  # [B, S]
-        y = pos_xyz[..., 1]  # [B, S]
-        z = pos_xyz[..., 2]  # [B, S]
+        if precomputed_indices is not None:
+            dx_idx, dy_idx, dz_idx = precomputed_indices
+        else:
+            # Fallback: compute indices on the fly (less efficient)
+            assert pos_xyz is not None, "Either pos_xyz or precomputed_indices required"
+            dx_idx, dy_idx, dz_idx = self.compute_indices(
+                pos_xyz, self.max_dist_xy, self.max_dist_z
+            )
 
-        # Compute pairwise relative distances
-        # d[i, j] = pos[i] - pos[j] (query position - key position)
-        dx = x.unsqueeze(-1) - x.unsqueeze(-2)  # [B, S, S]
-        dy = y.unsqueeze(-1) - y.unsqueeze(-2)  # [B, S, S]
-        dz = z.unsqueeze(-1) - z.unsqueeze(-2)  # [B, S, S]
-
-        # Clamp to valid range and shift to positive indices
-        dx = dx.clamp(-self.max_dist_xy, self.max_dist_xy) + self.max_dist_xy
-        dy = dy.clamp(-self.max_dist_xy, self.max_dist_xy) + self.max_dist_xy
-        dz = dz.clamp(-self.max_dist_z, self.max_dist_z) + self.max_dist_z
-
-        # Look up biases
-        bias_x = self.bias_x(dx.long())  # [B, S, S, n_heads]
-        bias_y = self.bias_y(dy.long())  # [B, S, S, n_heads]
-        bias_z = self.bias_z(dz.long())  # [B, S, S, n_heads]
+        # Look up biases - embedding expects long tensor
+        bias_x = self.bias_x(dx_idx.long())  # [B, S, S, n_heads]
+        bias_y = self.bias_y(dy_idx.long())  # [B, S, S, n_heads]
+        bias_z = self.bias_z(dz_idx.long())  # [B, S, S, n_heads]
 
         # Combine and transpose to [B, n_heads, S, S]
         bias = (bias_x + bias_y + bias_z).permute(0, 3, 1, 2)
@@ -473,12 +517,25 @@ class MultiHeadSelfAttention(nn.Module):
 
         # Optional: 3D relative position bias (complements 3D RoPE)
         self.relative_bias: RelativePositionBias3D | None = None
+        self.fused_attention_rpb: FusedAttentionWithRPB | None = None
+        self.use_fused_rpb = False
+
         if config.use_relative_bias:
-            self.relative_bias = RelativePositionBias3D(
-                max_dist_xy=config.max_relative_dist_xy,
-                max_dist_z=config.max_relative_dist_z,
-                n_heads=config.n_heads,
-            )
+            # Try to use fused Triton kernel if available and requested
+            if config.use_fused_rpb_kernel and TRITON_AVAILABLE and torch.cuda.is_available():
+                self.fused_attention_rpb = FusedAttentionWithRPB(
+                    max_dist_xy=config.max_relative_dist_xy,
+                    max_dist_z=config.max_relative_dist_z,
+                    n_heads=config.n_heads,
+                )
+                self.use_fused_rpb = True
+            else:
+                # Fallback to standard relative bias (slow, O(S²) memory)
+                self.relative_bias = RelativePositionBias3D(
+                    max_dist_xy=config.max_relative_dist_xy,
+                    max_dist_z=config.max_relative_dist_z,
+                    n_heads=config.n_heads,
+                )
 
         self.dropout = nn.Dropout(config.dropout)
 
@@ -492,6 +549,7 @@ class MultiHeadSelfAttention(nn.Module):
         pos_xyz: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         is_causal: bool = True,
+        rel_pos_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for multi-head attention.
@@ -505,6 +563,8 @@ class MultiHeadSelfAttention(nn.Module):
             pos_xyz: [batch, seq, 3] - position coordinates
             attention_mask: Optional mask for padding
             is_causal: Whether to apply causal masking
+            rel_pos_indices: Precomputed relative position indices (dx, dy, dz)
+                             for memory-efficient relative bias computation
 
         Returns:
             Output tensor [batch, seq, d_model]
@@ -529,13 +589,22 @@ class MultiHeadSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # If using relative position bias, compute attention manually
-        if self.relative_bias is not None:
+        # If using fused Triton kernel for relative position bias
+        if self.use_fused_rpb and self.fused_attention_rpb is not None:
+            # Use fused Triton kernel with RPB (memory efficient, O(S) instead of O(S²))
+            # Note: attention_mask is ignored - causal masking handles autoregressive training
+            # and ARC sequences have minimal/no padding
+            attn_out = self.fused_attention_rpb(
+                q, k, v, pos_xyz, is_causal=is_causal
+            )  # [B, heads, S, head_dim]
+
+        # If using standard relative position bias, compute attention manually
+        elif self.relative_bias is not None:
             # Compute attention scores
             attn_scores = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, S, S]
 
-            # Add relative position bias
-            rel_bias = self.relative_bias(pos_xyz)  # [B, heads, S, S]
+            # Add relative position bias (using precomputed indices if available)
+            rel_bias = self.relative_bias(precomputed_indices=rel_pos_indices, pos_xyz=pos_xyz)
             attn_scores = attn_scores + rel_bias
 
             # Apply causal mask
@@ -735,9 +804,10 @@ class TransformerBlock(nn.Module):
         pos_xyz: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         is_causal: bool = True,
+        rel_pos_indices: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # Pre-norm attention with residual
-        x = x + self.dropout(self.attn(self.ln1(x), pos_xyz, attention_mask, is_causal))
+        x = x + self.dropout(self.attn(self.ln1(x), pos_xyz, attention_mask, is_causal, rel_pos_indices))
         # Pre-norm FFN with residual
         x = x + self.dropout(self.ffn(self.ln2(x)))
         return x
@@ -932,9 +1002,18 @@ class TinyTransformer(nn.Module):
             size_embed = self.height_embed(grid_h_clamped) + self.width_embed(grid_w_clamped)
             x = x + size_embed.unsqueeze(1)  # Broadcast to all tokens
 
+        # Precompute relative position indices once (reused across all layers)
+        rel_pos_indices = None
+        if self.config.use_relative_bias:
+            rel_pos_indices = RelativePositionBias3D.compute_indices(
+                pos_xyz,
+                self.config.max_relative_dist_xy,
+                self.config.max_relative_dist_z,
+            )
+
         # Pass through transformer blocks
         for block in self.blocks:
-            x = block(x, pos_xyz, attention_mask, is_causal)
+            x = block(x, pos_xyz, attention_mask, is_causal, rel_pos_indices)
 
         # Final norm and projection
         x = self.ln_f(x)
@@ -1074,6 +1153,15 @@ class TinyTransformer(nn.Module):
             grid_w_clamped = grid_w.clamp(0, self.config.max_x).long()
             size_encoding = self.height_embed(grid_h_clamped) + self.width_embed(grid_w_clamped)
 
+        # Precompute relative position indices once (reused across all layers and K steps)
+        rel_pos_indices = None
+        if self.config.use_relative_bias:
+            rel_pos_indices = RelativePositionBias3D.compute_indices(
+                pos_xyz,
+                self.config.max_relative_dist_xy,
+                self.config.max_relative_dist_z,
+            )
+
         all_logits = []
 
         for k in range(K):
@@ -1089,7 +1177,7 @@ class TinyTransformer(nn.Module):
 
             # Forward through transformer blocks
             for block in self.blocks:
-                x = block(x, pos_xyz, attention_mask, is_causal)
+                x = block(x, pos_xyz, attention_mask, is_causal, rel_pos_indices)
 
             # Store hidden states before final norm (for refinement)
             hidden_states = x
