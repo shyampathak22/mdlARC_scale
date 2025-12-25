@@ -653,6 +653,8 @@ class TinyTransformer(nn.Module):
     Features:
     - 3D Rotary Position Embeddings for spatial awareness
     - Example embeddings to distinguish between train/test examples
+    - Optional edge distance encoding (distance to grid boundaries)
+    - Optional grid size encoding (awareness of grid dimensions)
     - KV cache for efficient inference
     """
 
@@ -665,6 +667,20 @@ class TinyTransformer(nn.Module):
 
         # Example embeddings (to distinguish different input-output pairs)
         self.example_embed = nn.Embedding(config.num_examples, config.d_model)
+
+        # Optional: Edge distance encoding (per-token)
+        # Encodes distance to left, right, top, bottom edges
+        self.edge_embed: nn.Linear | None = None
+        if config.use_edge_encoding:
+            self.edge_embed = nn.Linear(4, config.d_model, bias=False)
+
+        # Optional: Grid size encoding (global, added to all tokens)
+        # Encodes the height and width of the grid
+        self.height_embed: nn.Embedding | None = None
+        self.width_embed: nn.Embedding | None = None
+        if config.use_grid_size_encoding:
+            self.height_embed = nn.Embedding(config.max_y + 1, config.d_model)
+            self.width_embed = nn.Embedding(config.max_x + 1, config.d_model)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -695,6 +711,38 @@ class TinyTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+    def _compute_edge_distances(
+        self,
+        pos_xyz: torch.Tensor,
+        grid_h: torch.Tensor,
+        grid_w: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute distance to each edge for every token.
+
+        Args:
+            pos_xyz: [batch, seq, 3] - position coordinates
+            grid_h: [batch] - grid heights
+            grid_w: [batch] - grid widths
+
+        Returns:
+            edge_dist: [batch, seq, 4] - (left, right, top, bottom) distances
+        """
+        x = pos_xyz[..., 0].float()  # [B, S]
+        y = pos_xyz[..., 1].float()  # [B, S]
+
+        # Expand grid sizes for broadcasting
+        grid_w = grid_w.float().unsqueeze(1)  # [B, 1]
+        grid_h = grid_h.float().unsqueeze(1)  # [B, 1]
+
+        # Compute distances (normalized by grid size for scale invariance)
+        dist_left = x / grid_w.clamp(min=1)
+        dist_right = (grid_w - 1 - x) / grid_w.clamp(min=1)
+        dist_top = y / grid_h.clamp(min=1)
+        dist_bottom = (grid_h - 1 - y) / grid_h.clamp(min=1)
+
+        return torch.stack([dist_left, dist_right, dist_top, dist_bottom], dim=-1)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -702,6 +750,8 @@ class TinyTransformer(nn.Module):
         example_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         is_causal: bool = True,
+        grid_h: torch.Tensor | None = None,
+        grid_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -712,6 +762,8 @@ class TinyTransformer(nn.Module):
             example_ids: [batch] - example index for each sequence
             attention_mask: Optional attention mask
             is_causal: Whether to use causal masking
+            grid_h: [batch] - grid heights (optional, for edge/size encoding)
+            grid_w: [batch] - grid widths (optional, for edge/size encoding)
 
         Returns:
             Logits [batch, seq, vocab_size]
@@ -719,10 +771,31 @@ class TinyTransformer(nn.Module):
         # Token embeddings
         x = self.token_embed(input_ids)  # [B, S, d_model]
 
-        # Add example embeddings if provided
+        # Add example embeddings if provided (THE BOTTLENECK)
         if self.config.use_example_embedding and example_ids is not None:
             ex_embed = self.example_embed(example_ids)  # [B, d_model]
             x = x + ex_embed.unsqueeze(1)  # Broadcast across sequence
+
+        # Add edge distance encoding if enabled
+        if self.edge_embed is not None:
+            if grid_h is None or grid_w is None:
+                # Infer grid size from positions (max x+1, max y+1)
+                grid_w = pos_xyz[..., 0].max(dim=1).values + 1  # [B]
+                grid_h = pos_xyz[..., 1].max(dim=1).values + 1  # [B]
+            edge_dist = self._compute_edge_distances(pos_xyz, grid_h, grid_w)
+            x = x + self.edge_embed(edge_dist)
+
+        # Add grid size encoding if enabled
+        if self.height_embed is not None and self.width_embed is not None:
+            if grid_h is None or grid_w is None:
+                # Infer grid size from positions
+                grid_w = pos_xyz[..., 0].max(dim=1).values + 1  # [B]
+                grid_h = pos_xyz[..., 1].max(dim=1).values + 1  # [B]
+            # Clamp to valid embedding range
+            grid_h_clamped = grid_h.clamp(0, self.config.max_y).long()
+            grid_w_clamped = grid_w.clamp(0, self.config.max_x).long()
+            size_embed = self.height_embed(grid_h_clamped) + self.width_embed(grid_w_clamped)
+            x = x + size_embed.unsqueeze(1)  # Broadcast to all tokens
 
         # Pass through transformer blocks
         for block in self.blocks:
