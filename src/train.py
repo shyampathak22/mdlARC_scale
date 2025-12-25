@@ -38,6 +38,7 @@ from src.data import (
 )
 from src.transformer import (
     TinyTransformer,
+    compute_refinement_loss,
     create_large_model,
     create_medium_model,
     create_small_model,
@@ -119,6 +120,22 @@ class TrainConfig:
     norm_type: str = "rmsnorm"  # rmsnorm, layernorm
     ffn_type: str = "swiglu"  # swiglu, gelu
     use_example_embedding: bool = True
+
+    # NEW: 3D Relative Position Bias
+    use_relative_bias: bool = False
+    max_relative_dist_xy: int = 30
+    max_relative_dist_z: int = 8
+
+    # NEW: Edge and Grid Size Encoding
+    use_edge_encoding: bool = False
+    use_grid_size_encoding: bool = False
+
+    # NEW: Refinement Loop Training
+    num_refinement_steps: int = 1  # 1 = no refinement, >1 = refinement loop
+    refinement_use_gating: bool = True
+    refinement_focus_output: bool = True
+    refinement_loss_weighting: str = "linear"  # "uniform", "linear", "exponential"
+    refinement_output_only: bool = False
 
     # Data
     data_path: str = "data/challenges.json"
@@ -214,11 +231,23 @@ class TrainConfig:
 
         # [model] section
         if "model" in data:
-            flat["model_size"] = data["model"].get("size", "small")
-            flat["rope_type"] = data["model"].get("rope_type", "3d")
-            flat["norm_type"] = data["model"].get("norm_type", "rmsnorm")
-            flat["ffn_type"] = data["model"].get("ffn_type", "swiglu")
-            flat["use_example_embedding"] = data["model"].get("use_example_embedding", True)
+            m = data["model"]
+            flat["model_size"] = m.get("size", "small")
+            flat["rope_type"] = m.get("rope_type", "3d")
+            flat["norm_type"] = m.get("norm_type", "rmsnorm")
+            flat["ffn_type"] = m.get("ffn_type", "swiglu")
+            flat["use_example_embedding"] = m.get("use_example_embedding", True)
+            # NEW: 3D Relative Position Bias
+            flat["use_relative_bias"] = m.get("use_relative_bias", False)
+            flat["max_relative_dist_xy"] = m.get("max_relative_dist_xy", 30)
+            flat["max_relative_dist_z"] = m.get("max_relative_dist_z", 8)
+            # NEW: Edge and Grid Size Encoding
+            flat["use_edge_encoding"] = m.get("use_edge_encoding", False)
+            flat["use_grid_size_encoding"] = m.get("use_grid_size_encoding", False)
+            # NEW: Refinement Loop Training
+            flat["num_refinement_steps"] = m.get("num_refinement_steps", 1)
+            flat["refinement_use_gating"] = m.get("refinement_use_gating", True)
+            flat["refinement_focus_output"] = m.get("refinement_focus_output", True)
 
         # [data] section
         if "data" in data:
@@ -282,6 +311,9 @@ class TrainConfig:
             flat["output_color_balance_power"] = lo.get("output_color_balance_power", 0.5)
             flat["output_color_balance_max"] = lo.get("output_color_balance_max", 5.0)
             flat["output_color_balance_eps"] = lo.get("output_color_balance_eps", 1e-3)
+            # NEW: Refinement loss settings
+            flat["refinement_loss_weighting"] = lo.get("refinement_loss_weighting", "linear")
+            flat["refinement_output_only"] = lo.get("refinement_output_only", False)
 
         # [misc] section
         if "misc" in data:
@@ -708,26 +740,51 @@ def train_one_epoch(
         with ctx:
             # Forward pass with autocast
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits = model(
-                    input_ids, positions_3d,
-                    example_ids=example_ids,
-                    attention_mask=attention_mask,
-                )
+                # Check if refinement is enabled
+                use_refinement = config.num_refinement_steps > 1
 
-                losses = compute_loss(
-                    logits=logits,
-                    labels=input_ids,
-                    attention_mask=attention_mask,
-                    output_mask=output_mask,
-                    input_loss_weight=config.input_loss_weight,
-                    output_loss_weight=config.output_loss_weight,
-                    uniform_weight=config.uniform_loss_weight,
-                    output_token_weight=config.output_token_weight,
-                    balance_output_colors=config.balance_output_colors,
-                    output_color_balance_power=config.output_color_balance_power,
-                    output_color_balance_max=config.output_color_balance_max,
-                    output_color_balance_eps=config.output_color_balance_eps,
-                )
+                if use_refinement:
+                    # Refinement loop training: K forward passes with deep supervision
+                    all_logits = model.forward_with_refinement(
+                        input_ids, positions_3d,
+                        example_ids=example_ids,
+                        attention_mask=attention_mask,
+                    )
+                    # Use the final logits for accuracy tracking
+                    logits = all_logits[-1]
+
+                    # Compute refinement loss with deep supervision
+                    losses = compute_refinement_loss(
+                        all_logits=all_logits,
+                        labels=input_ids,
+                        attention_mask=attention_mask,
+                        output_mask=output_mask if config.refinement_output_only else None,
+                        weighting=config.refinement_loss_weighting,
+                        output_only=config.refinement_output_only,
+                    )
+                else:
+                    # Standard forward pass
+                    logits = model(
+                        input_ids, positions_3d,
+                        example_ids=example_ids,
+                        attention_mask=attention_mask,
+                    )
+
+                    losses = compute_loss(
+                        logits=logits,
+                        labels=input_ids,
+                        attention_mask=attention_mask,
+                        output_mask=output_mask,
+                        input_loss_weight=config.input_loss_weight,
+                        output_loss_weight=config.output_loss_weight,
+                        uniform_weight=config.uniform_loss_weight,
+                        output_token_weight=config.output_token_weight,
+                        balance_output_colors=config.balance_output_colors,
+                        output_color_balance_power=config.output_color_balance_power,
+                        output_color_balance_max=config.output_color_balance_max,
+                        output_color_balance_eps=config.output_color_balance_eps,
+                    )
+
                 # Scale loss by accumulation steps
                 loss = losses["loss"] / grad_accum_steps
 
@@ -914,26 +971,47 @@ def validate(
         output_mask = create_output_mask(input_ids)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits = model(
-                input_ids, positions_3d,
-                example_ids=example_ids,
-                attention_mask=attention_mask,
-            )
+            # Check if refinement is enabled
+            use_refinement = config.num_refinement_steps > 1
 
-            losses = compute_loss(
-                logits=logits,
-                labels=input_ids,
-                attention_mask=attention_mask,
-                output_mask=output_mask,
-                input_loss_weight=config.input_loss_weight,
-                output_loss_weight=config.output_loss_weight,
-                uniform_weight=config.uniform_loss_weight,
-                output_token_weight=config.output_token_weight,
-                balance_output_colors=config.balance_output_colors,
-                output_color_balance_power=config.output_color_balance_power,
-                output_color_balance_max=config.output_color_balance_max,
-                output_color_balance_eps=config.output_color_balance_eps,
-            )
+            if use_refinement:
+                # Refinement loop: use final logits for validation
+                all_logits = model.forward_with_refinement(
+                    input_ids, positions_3d,
+                    example_ids=example_ids,
+                    attention_mask=attention_mask,
+                )
+                logits = all_logits[-1]
+
+                losses = compute_refinement_loss(
+                    all_logits=all_logits,
+                    labels=input_ids,
+                    attention_mask=attention_mask,
+                    output_mask=output_mask if config.refinement_output_only else None,
+                    weighting=config.refinement_loss_weighting,
+                    output_only=config.refinement_output_only,
+                )
+            else:
+                logits = model(
+                    input_ids, positions_3d,
+                    example_ids=example_ids,
+                    attention_mask=attention_mask,
+                )
+
+                losses = compute_loss(
+                    logits=logits,
+                    labels=input_ids,
+                    attention_mask=attention_mask,
+                    output_mask=output_mask,
+                    input_loss_weight=config.input_loss_weight,
+                    output_loss_weight=config.output_loss_weight,
+                    uniform_weight=config.uniform_loss_weight,
+                    output_token_weight=config.output_token_weight,
+                    balance_output_colors=config.balance_output_colors,
+                    output_color_balance_power=config.output_color_balance_power,
+                    output_color_balance_max=config.output_color_balance_max,
+                    output_color_balance_eps=config.output_color_balance_eps,
+                )
 
         # Compute accuracy
         preds = logits.argmax(dim=-1)
@@ -1109,6 +1187,17 @@ def create_model_from_config(config: TrainConfig) -> TinyTransformer:
         norm_type=config.norm_type,
         ffn_type=config.ffn_type,
         use_example_embedding=config.use_example_embedding,
+        # NEW: 3D Relative Position Bias
+        use_relative_bias=config.use_relative_bias,
+        max_relative_dist_xy=config.max_relative_dist_xy,
+        max_relative_dist_z=config.max_relative_dist_z,
+        # NEW: Edge and Grid Size Encoding
+        use_edge_encoding=config.use_edge_encoding,
+        use_grid_size_encoding=config.use_grid_size_encoding,
+        # NEW: Refinement Loop Training
+        num_refinement_steps=config.num_refinement_steps,
+        refinement_use_gating=config.refinement_use_gating,
+        refinement_focus_output=config.refinement_focus_output,
     )
 
 

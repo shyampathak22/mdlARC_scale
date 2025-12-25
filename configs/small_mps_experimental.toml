@@ -1,0 +1,90 @@
+# Small model config (~29M + ~4M refinement params) - optimized for Apple Silicon (MPS)
+# Includes NEW experimental features: 3D relative bias, edge/grid encoding, refinement loop
+#
+# Use: uv run train --config small_mps_experimental
+#
+# Key features enabled:
+# - 3D relative position bias (complements 3D RoPE)
+# - Edge distance encoding (distance to grid boundaries)
+# - Grid size encoding (awareness of H×W dimensions)
+# - Refinement loop training with K=3 steps (TRM-style)
+
+[model]
+size = "small"
+# 3D RoPE settings (existing)
+rope_type = "3d"
+norm_type = "rmsnorm"
+ffn_type = "swiglu"
+use_example_embedding = true
+
+# NEW: 3D Relative Position Bias
+use_relative_bias = true
+max_relative_dist_xy = 30
+max_relative_dist_z = 8
+
+# NEW: Edge and Grid Size Encoding
+use_edge_encoding = true
+use_grid_size_encoding = true
+
+# NEW: Refinement Loop Training
+num_refinement_steps = 3
+refinement_use_gating = true
+refinement_focus_output = true
+
+[data]
+path = "data/arc-agi_training_challenges.json"
+solutions_path = "data/arc-agi_training_solutions.json"
+max_seq_len = 1863
+
+[training]
+# Batch size 4 with grad_accum 8 = effective batch size 32
+# Refinement adds ~12% params, may need smaller batch if OOM
+batch_size = 4
+effective_batch_size = 32
+epochs = 100
+lr = 3e-4
+weight_decay = 0.01
+grad_clip = 1.0
+warmup_fraction = 0.05
+
+[augmentation]
+apply_dihedral = true
+num_color_perms = 100
+color_seed = 42
+
+[hardware]
+# torch.compile not supported on MPS
+compile_model = false
+# AMP uses float16 on MPS (automatic via get_amp_dtype)
+use_amp = true
+# Multiprocessing with spawn context
+num_workers = 4
+
+[checkpointing]
+save_dir = "checkpoints/small_mps_experimental"
+save_every = 10
+
+[logging]
+use_wandb = true
+wandb_project = "mdlARC_scale"
+wandb_run_name = "small_mps_3drpb_edge_refine"
+log_every = 10
+wandb_log_every = 50
+ema_decay = 0.99
+
+[loss]
+# For refinement, we use deep supervision (handled in forward_with_refinement)
+# These settings apply to non-refinement forward pass
+uniform_loss_weight = true
+input_loss_weight = 1.0
+output_loss_weight = 1.0
+
+# NEW: Refinement loss settings
+refinement_loss_weighting = "linear"  # "uniform", "linear", "exponential"
+refinement_output_only = false        # If true, only compute loss on output tokens
+
+[misc]
+seed = 42
+# M-series chip FP16 performance (adjust for your chip)
+# M1: ~5.5, M2: ~7.0, M3: ~10.0, M4: ~14.0
+peak_tflops = 10.0

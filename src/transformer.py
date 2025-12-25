@@ -5,11 +5,99 @@ Reproduced from scratch based on the mdlARC paper/approach.
 Key innovation: 3D RoPE that handles spatial (x, y) + example (z) coordinates.
 """
 
+import math
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def compute_refinement_loss(
+    all_logits: list[torch.Tensor],
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    output_mask: torch.Tensor | None = None,
+    weighting: Literal["uniform", "linear", "exponential"] = "linear",
+    output_only: bool = False,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """
+    Compute deep supervision loss over refinement steps.
+
+    Args:
+        all_logits: List of K logits tensors [batch, seq, vocab]
+        labels: [batch, seq] target token indices
+        attention_mask: [batch, seq] valid token mask (True = valid)
+        output_mask: [batch, seq] output token mask (True = output)
+        weighting: How to weight losses across steps
+            - "uniform": all steps equal
+            - "linear": later steps weighted more (1, 2, 3, ...)
+            - "exponential": exponentially more weight on later steps
+        output_only: If True, only compute loss on output tokens
+
+    Returns:
+        total_loss: Weighted sum of per-step losses
+        loss_dict: Dictionary with per-step losses for logging
+    """
+    K = len(all_logits)
+    device = all_logits[0].device
+    dtype = all_logits[0].dtype
+
+    # Compute weights based on weighting scheme
+    if weighting == "uniform":
+        weights = [1.0 / K] * K
+    elif weighting == "linear":
+        # [1, 2, 3, ...] normalized
+        raw = [(k + 1) for k in range(K)]
+        total = sum(raw)
+        weights = [w / total for w in raw]
+    elif weighting == "exponential":
+        # [1, 2, 4, 8, ...] normalized
+        raw = [2.0 ** k for k in range(K)]
+        total = sum(raw)
+        weights = [w / total for w in raw]
+    else:
+        raise ValueError(f"Unknown weighting: {weighting}")
+
+    # Build per-token mask
+    if attention_mask is not None:
+        token_mask = attention_mask.float()
+    else:
+        token_mask = torch.ones_like(labels, dtype=dtype)
+
+    # Optionally restrict to output tokens only
+    if output_only and output_mask is not None:
+        token_mask = token_mask * output_mask.float()
+
+    # Shift for next-token prediction: logits[:, :-1] predicts labels[:, 1:]
+    shift_mask = token_mask[:, 1:]  # [B, S-1]
+    shift_labels = labels[:, 1:]    # [B, S-1]
+
+    total_loss = torch.tensor(0.0, device=device, dtype=dtype)
+    loss_dict = {}
+
+    for k, logits in enumerate(all_logits):
+        shift_logits = logits[:, :-1, :].contiguous()  # [B, S-1, V]
+
+        # Compute per-token loss
+        vocab_size = shift_logits.size(-1)
+        flat_logits = shift_logits.view(-1, vocab_size)
+        flat_labels = shift_labels.view(-1)
+        per_token_loss = F.cross_entropy(flat_logits, flat_labels, reduction='none')
+        per_token_loss = per_token_loss.view_as(shift_labels)
+
+        # Apply mask and compute mean
+        masked_loss = per_token_loss * shift_mask
+        step_loss = masked_loss.sum() / shift_mask.sum().clamp(min=1)
+
+        # Accumulate weighted loss
+        total_loss = total_loss + weights[k] * step_loss
+        loss_dict[f"loss_step_{k}"] = step_loss.detach()
+
+    loss_dict["loss_total"] = total_loss.detach()
+
+    return total_loss, loss_dict
 
 
 @dataclass
@@ -40,7 +128,9 @@ class TransformerConfig:
     use_edge_encoding: bool = False  # Add per-token edge distance features
     use_grid_size_encoding: bool = False  # Add global grid size embedding
     # New: Refinement loop training
-    num_refinement_steps: int = 1    # Number of refinement iterations (1 = standard, >1 = refinement)
+    num_refinement_steps: int = 1        # Number of refinement iterations (1 = standard, >1 = refinement)
+    refinement_use_gating: bool = True   # Use gated updates for stability
+    refinement_focus_output: bool = True # Focus attention on output tokens during refinement
 
 
 class RMSNorm(nn.Module):
@@ -682,6 +772,31 @@ class TinyTransformer(nn.Module):
             self.height_embed = nn.Embedding(config.max_y + 1, config.d_model)
             self.width_embed = nn.Embedding(config.max_x + 1, config.d_model)
 
+        # Optional: Refinement loop modules
+        # Uses cross-attention + gated residual update for example embedding refinement
+        self.refine_query_proj: nn.Linear | None = None
+        self.refine_key_proj: nn.Linear | None = None
+        self.refine_value_proj: nn.Linear | None = None
+        self.refine_out_proj: nn.Linear | None = None
+        self.refine_gate: nn.Linear | None = None
+
+        if config.num_refinement_steps > 1:
+            # Cross-attention projections for refinement
+            self.refine_query_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.refine_key_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.refine_value_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+            self.refine_out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
+
+            # Initialize output projection with small values for stable residual updates
+            nn.init.normal_(self.refine_out_proj.weight, std=0.01)
+
+            # Gated update: learns how much to incorporate the refinement
+            if config.refinement_use_gating:
+                self.refine_gate = nn.Linear(2 * config.d_model, config.d_model, bias=True)
+                # Initialize gate bias negative so initial gate values are small
+                nn.init.zeros_(self.refine_gate.weight)
+                nn.init.constant_(self.refine_gate.bias, -2.0)  # sigmoid(-2) ≈ 0.12
+
         # Transformer blocks
         self.blocks = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.n_layers)
@@ -806,6 +921,169 @@ class TinyTransformer(nn.Module):
         logits = self.lm_head(x)
 
         return logits
+
+    def _refine_example_embed(
+        self,
+        ex_embed: torch.Tensor,
+        hidden_states: torch.Tensor,
+        output_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Refine the example embedding using cross-attention over hidden states.
+
+        The example embedding "queries" the hidden states to find relevant
+        information for refinement. This implements the TRM-style iterative
+        update while preserving the bottleneck.
+
+        Args:
+            ex_embed: [batch, d_model] - current example embedding
+            hidden_states: [batch, seq, d_model] - transformer hidden states
+            output_mask: [batch, seq] - optional mask to focus on output tokens
+
+        Returns:
+            Updated example embedding [batch, d_model]
+        """
+        batch, seq_len, d_model = hidden_states.shape
+
+        # Project for cross-attention
+        assert self.refine_query_proj is not None
+        assert self.refine_key_proj is not None
+        assert self.refine_value_proj is not None
+        assert self.refine_out_proj is not None
+
+        query = self.refine_query_proj(ex_embed).unsqueeze(1)  # [B, 1, d_model]
+        keys = self.refine_key_proj(hidden_states)              # [B, S, d_model]
+        values = self.refine_value_proj(hidden_states)          # [B, S, d_model]
+
+        # Compute attention scores
+        scale = d_model ** -0.5
+        attn_scores = torch.bmm(query, keys.transpose(1, 2)) * scale  # [B, 1, S]
+
+        # Optionally focus attention on output tokens
+        if output_mask is not None and self.config.refinement_focus_output:
+            # output_mask: [B, S] where True = output token
+            # Mask out non-output tokens with large negative value
+            mask_value = torch.finfo(attn_scores.dtype).min
+            attn_scores = attn_scores.masked_fill(
+                ~output_mask.unsqueeze(1),  # [B, 1, S]
+                mask_value
+            )
+
+        # Softmax and apply to values
+        attn_weights = F.softmax(attn_scores, dim=-1)  # [B, 1, S]
+        context = torch.bmm(attn_weights, values).squeeze(1)  # [B, d_model]
+
+        # Project context for update
+        update = self.refine_out_proj(context)  # [B, d_model]
+
+        # Apply gated residual update
+        if self.refine_gate is not None:
+            # Compute gate: how much to incorporate the update
+            gate_input = torch.cat([ex_embed, context], dim=-1)  # [B, 2*d_model]
+            gate = torch.sigmoid(self.refine_gate(gate_input))    # [B, d_model]
+            # Gated residual: ex_embed + gate * update
+            refined = ex_embed + gate * update
+        else:
+            # Simple residual update
+            refined = ex_embed + update
+
+        return refined
+
+    def forward_with_refinement(
+        self,
+        input_ids: torch.Tensor,
+        pos_xyz: torch.Tensor,
+        example_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        output_mask: torch.Tensor | None = None,
+        is_causal: bool = True,
+        grid_h: torch.Tensor | None = None,
+        grid_w: torch.Tensor | None = None,
+        num_steps: int | None = None,
+    ) -> list[torch.Tensor]:
+        """
+        Forward pass with iterative refinement of the example embedding.
+
+        Implements TRM-style refinement where:
+        1. Initial forward pass with base example embedding
+        2. Refine example embedding using cross-attention over hidden states
+        3. Repeat for K steps
+        4. Return logits at each step for deep supervision
+
+        Args:
+            input_ids: [batch, seq] - token indices
+            pos_xyz: [batch, seq, 3] - 3D position coordinates
+            example_ids: [batch] - example index for each sequence
+            attention_mask: Optional attention mask
+            output_mask: [batch, seq] - mask for output tokens (for focused refinement)
+            is_causal: Whether to use causal masking
+            grid_h: [batch] - grid heights (optional)
+            grid_w: [batch] - grid widths (optional)
+            num_steps: Override config.num_refinement_steps
+
+        Returns:
+            List of logits tensors, one per refinement step [K × (batch, seq, vocab)]
+        """
+        K = num_steps if num_steps is not None else self.config.num_refinement_steps
+
+        if K <= 1 or self.refine_query_proj is None:
+            # No refinement, just return regular forward pass in a list
+            return [self.forward(
+                input_ids, pos_xyz, example_ids, attention_mask, is_causal, grid_h, grid_w
+            )]
+
+        # Get initial example embedding
+        ex_embed = self.example_embed(example_ids)  # [B, d_model]
+
+        # Precompute edge distances if needed (avoid recomputing each step)
+        edge_encoding = None
+        if self.edge_embed is not None:
+            if grid_h is None or grid_w is None:
+                grid_w = pos_xyz[..., 0].max(dim=1).values + 1
+                grid_h = pos_xyz[..., 1].max(dim=1).values + 1
+            edge_dist = self._compute_edge_distances(pos_xyz, grid_h, grid_w)
+            edge_encoding = self.edge_embed(edge_dist)
+
+        # Precompute grid size embedding if needed
+        size_encoding = None
+        if self.height_embed is not None and self.width_embed is not None:
+            if grid_h is None or grid_w is None:
+                grid_w = pos_xyz[..., 0].max(dim=1).values + 1
+                grid_h = pos_xyz[..., 1].max(dim=1).values + 1
+            grid_h_clamped = grid_h.clamp(0, self.config.max_y).long()
+            grid_w_clamped = grid_w.clamp(0, self.config.max_x).long()
+            size_encoding = self.height_embed(grid_h_clamped) + self.width_embed(grid_w_clamped)
+
+        all_logits = []
+
+        for k in range(K):
+            # Build input embeddings with current example embedding
+            x = self.token_embed(input_ids)  # [B, S, d_model]
+            x = x + ex_embed.unsqueeze(1)     # Add example embedding (THE BOTTLENECK)
+
+            # Add precomputed encodings
+            if edge_encoding is not None:
+                x = x + edge_encoding
+            if size_encoding is not None:
+                x = x + size_encoding.unsqueeze(1)
+
+            # Forward through transformer blocks
+            for block in self.blocks:
+                x = block(x, pos_xyz, attention_mask, is_causal)
+
+            # Store hidden states before final norm (for refinement)
+            hidden_states = x
+
+            # Compute logits
+            x = self.ln_f(x)
+            logits = self.lm_head(x)
+            all_logits.append(logits)
+
+            # Refine example embedding for next iteration (except last step)
+            if k < K - 1:
+                ex_embed = self._refine_example_embed(ex_embed, hidden_states, output_mask)
+
+        return all_logits
 
     def generate(
         self,
