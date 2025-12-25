@@ -5,9 +5,10 @@ Key features:
 - Separate input/output loss tracking
 - AdamW with selective weight decay
 - Linear warmup + cosine decay LR schedule
-- BF16 autocast on CUDA
-- torch.compile() for performance
+- Mixed precision: BF16 on CUDA, FP16 on MPS
+- torch.compile() for performance (CUDA only)
 - Checkpointing with RNG state for reproducibility
+- MPS (Apple Silicon) support for training on Mac
 """
 
 import math
@@ -42,6 +43,66 @@ from src.transformer import (
     create_small_model,
     create_tiny_model,
 )
+
+# =============================================================================
+# DEVICE DETECTION
+# =============================================================================
+
+
+def get_best_device() -> torch.device:
+    """
+    Get the best available device for training.
+
+    Priority: CUDA > MPS > CPU
+
+    Returns:
+        torch.device: The best available device
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+def get_amp_dtype(device: torch.device) -> torch.dtype:
+    """
+    Get the appropriate AMP dtype for the device.
+
+    - CUDA: bfloat16 (best stability and performance)
+    - MPS: float16 (bfloat16 not fully supported)
+    - CPU: float32 (no AMP benefit)
+
+    Args:
+        device: The target device
+
+    Returns:
+        torch.dtype: The appropriate dtype for mixed precision
+    """
+    if device.type == "cuda":
+        return torch.bfloat16
+    elif device.type == "mps":
+        return torch.float16
+    else:
+        return torch.float32
+
+
+def supports_compile(device: torch.device) -> bool:
+    """
+    Check if torch.compile() is supported on this device.
+
+    Currently only CUDA has stable torch.compile() support.
+    MPS support is experimental and often causes issues.
+
+    Args:
+        device: The target device
+
+    Returns:
+        bool: Whether torch.compile() should be used
+    """
+    return device.type == "cuda"
+
 
 # =============================================================================
 # CONFIGURATION
@@ -90,8 +151,9 @@ class TrainConfig:
     val_every: int = 1  # epochs
 
     # Hardware
+    device: str | None = None  # None = auto-detect (cuda > mps > cpu)
     compile_model: bool = True
-    use_amp: bool = True  # BF16 autocast
+    use_amp: bool = True  # BF16 on CUDA, FP16 on MPS
 
     # Distributed training
     use_ddp: bool = False  # Enable DistributedDataParallel
@@ -441,8 +503,12 @@ def create_optimizer(
     """Create AdamW optimizer with selective weight decay."""
     param_groups = build_param_groups(model, weight_decay)
 
-    # Use fused AdamW on CUDA for performance
-    use_fused = device.type == "cuda" and "fused" in AdamW.__init__.__code__.co_varnames
+    # Use fused AdamW on CUDA for performance (not available on MPS/CPU)
+    use_fused = (
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and "fused" in AdamW.__init__.__code__.co_varnames
+    )
 
     return AdamW(param_groups, lr=lr, fused=use_fused)
 
@@ -565,8 +631,9 @@ def train_one_epoch(
 
     start_time = time.perf_counter()
 
-    use_amp = config.use_amp and device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    # AMP supported on CUDA (bfloat16) and MPS (float16)
+    use_amp = config.use_amp and device.type in ("cuda", "mps")
+    amp_dtype = get_amp_dtype(device) if use_amp else torch.float32
 
     # Gradient accumulation setup
     grad_accum_steps = config.grad_accum_steps
@@ -834,8 +901,9 @@ def validate(
     total_output_tokens = 0
     num_tokens = 0
 
-    use_amp = config.use_amp and device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    # AMP supported on CUDA (bfloat16) and MPS (float16)
+    use_amp = config.use_amp and device.type in ("cuda", "mps")
+    amp_dtype = get_amp_dtype(device) if use_amp else torch.float32
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
@@ -902,6 +970,9 @@ def get_rng_state() -> dict:
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
+    if torch.backends.mps.is_available():
+        # MPS doesn't have a separate RNG state API, but we capture torch state above
+        state["mps"] = True  # Marker that MPS was available
     return state
 
 
@@ -913,6 +984,7 @@ def set_rng_state(state: dict) -> None:
         torch.set_rng_state(state["torch"])
     if state.get("cuda") is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+    # MPS uses the main torch RNG state, no separate restoration needed
 
 
 def save_checkpoint(
@@ -1152,12 +1224,28 @@ def train(config: TrainConfig) -> TinyTransformer:
         world_size = dist.get_world_size()
         is_rank_zero = local_rank == 0
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Use specified device or auto-detect best available
+        if config.device is not None:
+            device = torch.device(config.device)
+        else:
+            device = get_best_device()
         world_size = 1
         is_rank_zero = True
 
+    # MPS-specific warnings
+    if device.type == "mps":
+        if config.use_ddp:
+            raise RuntimeError("DDP is not supported on MPS. Use single-GPU training.")
+        if config.compile_model:
+            print("Warning: torch.compile() is not well supported on MPS, disabling...")
+            config.compile_model = False
+
     if is_rank_zero:
         print(f"Using device: {device}")
+        if device.type == "mps":
+            print("  MPS (Apple Silicon) detected - using float16 for mixed precision")
+        elif device.type == "cuda":
+            print("  CUDA detected - using bfloat16 for mixed precision")
         if config.use_ddp:
             print(f"DDP enabled with {world_size} GPUs")
         print(f"Gradient accumulation steps: {config.grad_accum_steps}")
@@ -1196,6 +1284,7 @@ def train(config: TrainConfig) -> TinyTransformer:
     np.random.seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(config.seed)
+    # MPS uses the main torch seed, no separate seeding needed
 
     # Create model
     if is_rank_zero:
@@ -1213,7 +1302,8 @@ def train(config: TrainConfig) -> TinyTransformer:
         )
 
     # Compile if requested (after DDP wrapping)
-    if config.compile_model and device.type == "cuda":
+    # torch.compile() is only stable on CUDA; MPS support is experimental
+    if config.compile_model and supports_compile(device):
         if is_rank_zero:
             print("Compiling model with torch.compile()...")
         model = torch.compile(model)
@@ -1521,6 +1611,8 @@ Examples:
     parser.add_argument("--lr", type=float)
     parser.add_argument("--save-dir", type=str)
     parser.add_argument("--resume", type=str, help="Resume from checkpoint")
+    parser.add_argument("--device", type=str, help="Device to use (cuda, mps, cpu). Auto-detects if not set.")
+    parser.add_argument("--num-workers", type=int, help="Number of dataloader workers (0 for MPS compatibility)")
     parser.add_argument("--no-compile", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--ddp", action="store_true", help="Enable DistributedDataParallel")
@@ -1584,6 +1676,10 @@ Examples:
         config.save_dir = args.save_dir
     if args.resume is not None:
         config.resume_from = args.resume
+    if args.device is not None:
+        config.device = args.device
+    if args.num_workers is not None:
+        config.num_workers = args.num_workers
     if args.no_compile:
         config.compile_model = False
     if args.no_amp:

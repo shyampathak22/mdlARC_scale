@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from src.data import END_TOKEN_ID, compute_positions_3d, encode_example
 from src.inference import predict_with_augmentations
-from src.train import TrainConfig, compute_loss, create_output_mask
+from src.train import TrainConfig, compute_loss, create_output_mask, get_best_device
 from src.transformer import (
     TinyTransformer,
     create_large_model,
@@ -1058,8 +1058,8 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to run on (default: cuda if available)",
+        default=None,  # Will use get_best_device() if not specified
+        help="Device to run on (default: cuda > mps > cpu)",
     )
     parser.add_argument(
         "--quiet",
@@ -1093,7 +1093,11 @@ def main():
     else:
         rank = 0
         world_size = 1
-        device = torch.device(args.device)
+        # Use specified device or auto-detect best available (CUDA > MPS > CPU)
+        if args.device is not None:
+            device = torch.device(args.device)
+        else:
+            device = get_best_device()
         is_main = True
 
     if is_main:

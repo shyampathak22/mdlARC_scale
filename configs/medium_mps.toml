@@ -1,0 +1,64 @@
+# Medium model config (~103M params) - optimized for Apple Silicon (MPS)
+#
+# Designed for MacBook Pro M4 Max with 36GB unified memory.
+# Use: uv run train --config medium_mps
+#
+# Key MPS-specific optimizations:
+# - torch.compile disabled (not well supported on MPS)
+# - Mixed precision uses float16 (bfloat16 not fully supported)
+# - Reduced num_workers to avoid multiprocessing overhead
+# - Batch size tuned for 36GB unified memory
+
+[model]
+size = "medium"
+
+[data]
+path = "data/arc-agi_training_challenges.json"
+solutions_path = "data/arc-agi_training_solutions.json"
+max_seq_len = 1863
+
+[training]
+# Batch size 4 with grad_accum 8 = effective batch size 32
+# May need to reduce to 2 if OOM on smaller memory Macs
+batch_size = 4
+effective_batch_size = 32
+epochs = 100
+lr = 2e-4
+weight_decay = 0.01
+grad_clip = 1.0
+warmup_fraction = 0.05
+
+[augmentation]
+apply_dihedral = true
+num_color_perms = 100
+color_seed = 42
+
+[hardware]
+# torch.compile not well supported on MPS
+compile_model = false
+# AMP uses float16 on MPS (automatic via get_amp_dtype)
+use_amp = true
+# Now supports multiprocessing with spawn context (fixed pickle issue)
+num_workers = 4
+
+[checkpointing]
+save_dir = "checkpoints/medium_mps"
+save_every = 10
+
+[logging]
+use_wandb = true
+wandb_project = "mdlARC_scale"
+log_every = 10
+wandb_log_every = 50
+ema_decay = 0.99
+
+[loss]
+uniform_loss_weight = true
+input_loss_weight = 1.0
+output_loss_weight = 1.0
+
+[misc]
+seed = 42
+# M4 Max peak FP16 performance (approximate)
+# Used for MFU calculation - adjust based on actual chip
+peak_tflops = 14.0

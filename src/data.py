@@ -650,6 +650,17 @@ def collate_fn(
     }
 
 
+class CollateWrapper:
+    """Picklable collate function wrapper for multiprocessing compatibility."""
+
+    def __init__(self, color_perms: torch.Tensor | None, color_perm_idx: int):
+        self.color_perms = color_perms
+        self.color_perm_idx = color_perm_idx
+
+    def __call__(self, batch):
+        return collate_fn(batch, self.color_perms, self.color_perm_idx)
+
+
 def create_dataloader(
     dataset: ARCDataset,
     batch_size: int,
@@ -673,8 +684,14 @@ def create_dataloader(
     Returns:
         DataLoader instance
     """
-    def collate(batch):
-        return collate_fn(batch, color_perms, color_perm_idx)
+    # Use a class-based collate for multiprocessing compatibility (picklable)
+    collate = CollateWrapper(color_perms, color_perm_idx)
+
+    # pin_memory only works on CUDA, not on MPS or CPU
+    use_pin_memory = torch.cuda.is_available()
+
+    # Use spawn multiprocessing context on macOS for Python 3.13+ compatibility
+    mp_context = "spawn" if num_workers > 0 else None
 
     if sampler is not None:
         # Use external sampler (e.g., DistributedSampler for DDP)
@@ -685,8 +702,9 @@ def create_dataloader(
             sampler=sampler,
             collate_fn=collate,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             drop_last=True,  # Important for DDP to keep batch sizes consistent
+            multiprocessing_context=mp_context,
         )
     else:
         # Use length-bucketed batching
@@ -700,7 +718,8 @@ def create_dataloader(
             batch_sampler=bucket_sampler,
             collate_fn=collate,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
+            multiprocessing_context=mp_context,
         )
 
 

@@ -32,6 +32,15 @@ class TransformerConfig:
     norm_type: str = "rmsnorm"    # "rmsnorm" or "layernorm"
     ffn_type: str = "swiglu"      # "swiglu" or "gelu"
     use_example_embedding: bool = True  # If False, ignore example IDs
+    # New: 3D relative position bias (matches 3D RoPE dimensions)
+    use_relative_bias: bool = False  # Add learnable relative position bias to attention
+    max_relative_dist_xy: int = 30   # Maximum relative distance for x/y bias table
+    max_relative_dist_z: int = 8     # Maximum relative distance for z (semantic layer) bias table
+    # New: Edge and grid size encoding
+    use_edge_encoding: bool = False  # Add per-token edge distance features
+    use_grid_size_encoding: bool = False  # Add global grid size embedding
+    # New: Refinement loop training
+    num_refinement_steps: int = 1    # Number of refinement iterations (1 = standard, >1 = refinement)
 
 
 class RMSNorm(nn.Module):
@@ -232,6 +241,76 @@ class RotaryEmbedding1D(nn.Module):
         return q_rot, k_rot
 
 
+class RelativePositionBias3D(nn.Module):
+    """
+    Learnable 3D relative position bias for attention.
+
+    Adds a learnable bias to attention scores based on the relative
+    x, y, and z distances between query and key positions. This complements
+    3D RoPE by providing explicit distance-based attention modulation.
+
+    The z dimension captures semantic layer distances:
+    - z_diff=0: same region (input→input or output→output)
+    - z_diff=2: input↔output (the key transformation relationship)
+    """
+
+    def __init__(self, max_dist_xy: int, max_dist_z: int, n_heads: int):
+        super().__init__()
+        self.max_dist_xy = max_dist_xy
+        self.max_dist_z = max_dist_z
+        self.n_heads = n_heads
+
+        # Learnable bias tables for x, y, and z distances
+        # Range: [-max_dist, max_dist] -> 2*max_dist + 1 entries
+        num_buckets_xy = 2 * max_dist_xy + 1
+        num_buckets_z = 2 * max_dist_z + 1
+
+        self.bias_x = nn.Embedding(num_buckets_xy, n_heads)
+        self.bias_y = nn.Embedding(num_buckets_xy, n_heads)
+        self.bias_z = nn.Embedding(num_buckets_z, n_heads)
+
+        # Initialize with small values
+        nn.init.normal_(self.bias_x.weight, std=0.02)
+        nn.init.normal_(self.bias_y.weight, std=0.02)
+        nn.init.normal_(self.bias_z.weight, std=0.02)
+
+    def forward(self, pos_xyz: torch.Tensor) -> torch.Tensor:
+        """
+        Compute 3D relative position bias for attention.
+
+        Args:
+            pos_xyz: [batch, seq, 3] position coordinates (x, y, z)
+
+        Returns:
+            bias: [batch, n_heads, seq, seq] attention bias
+        """
+        # Extract x, y, z positions
+        x = pos_xyz[..., 0]  # [B, S]
+        y = pos_xyz[..., 1]  # [B, S]
+        z = pos_xyz[..., 2]  # [B, S]
+
+        # Compute pairwise relative distances
+        # d[i, j] = pos[i] - pos[j] (query position - key position)
+        dx = x.unsqueeze(-1) - x.unsqueeze(-2)  # [B, S, S]
+        dy = y.unsqueeze(-1) - y.unsqueeze(-2)  # [B, S, S]
+        dz = z.unsqueeze(-1) - z.unsqueeze(-2)  # [B, S, S]
+
+        # Clamp to valid range and shift to positive indices
+        dx = dx.clamp(-self.max_dist_xy, self.max_dist_xy) + self.max_dist_xy
+        dy = dy.clamp(-self.max_dist_xy, self.max_dist_xy) + self.max_dist_xy
+        dz = dz.clamp(-self.max_dist_z, self.max_dist_z) + self.max_dist_z
+
+        # Look up biases
+        bias_x = self.bias_x(dx.long())  # [B, S, S, n_heads]
+        bias_y = self.bias_y(dy.long())  # [B, S, S, n_heads]
+        bias_z = self.bias_z(dz.long())  # [B, S, S, n_heads]
+
+        # Combine and transpose to [B, n_heads, S, S]
+        bias = (bias_x + bias_y + bias_z).permute(0, 3, 1, 2)
+
+        return bias
+
+
 def build_norm(norm_type: str, dim: int, eps: float) -> nn.Module:
     """Factory for normalization layers."""
     norm = norm_type.lower()
@@ -243,7 +322,7 @@ def build_norm(norm_type: str, dim: int, eps: float) -> nn.Module:
 
 
 class MultiHeadSelfAttention(nn.Module):
-    """Multi-head self-attention with 3D RoPE support."""
+    """Multi-head self-attention with 3D RoPE support and optional relative position bias."""
 
     def __init__(self, config: TransformerConfig):
         super().__init__()
@@ -282,6 +361,15 @@ class MultiHeadSelfAttention(nn.Module):
         else:
             raise ValueError(f"Unknown rope_type: {config.rope_type}")
 
+        # Optional: 3D relative position bias (complements 3D RoPE)
+        self.relative_bias: RelativePositionBias3D | None = None
+        if config.use_relative_bias:
+            self.relative_bias = RelativePositionBias3D(
+                max_dist_xy=config.max_relative_dist_xy,
+                max_dist_z=config.max_relative_dist_z,
+                n_heads=config.n_heads,
+            )
+
         self.dropout = nn.Dropout(config.dropout)
 
         # KV cache for inference
@@ -300,6 +388,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         Uses PyTorch's native scaled_dot_product_attention which automatically
         selects the best backend (FlashAttention, Memory-Efficient, or Math).
+        When relative_bias is enabled, falls back to manual attention computation.
 
         Args:
             x: [batch, seq, d_model]
@@ -330,23 +419,70 @@ class MultiHeadSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Convert boolean mask to float attention mask for SDPA
-        # SDPA expects float mask where -inf masks out positions
-        attn_mask = None
-        if attention_mask is not None:
-            # attention_mask: [B, S] bool where True = valid, False = padding
-            # Convert to [B, 1, 1, S] float where 0.0 = valid, -inf = padding
-            # Keep as bool for torch.where predicate, then cast to q.dtype
-            bool_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attn_mask = torch.where(bool_mask, 0.0, float('-inf')).to(q.dtype)
+        # If using relative position bias, compute attention manually
+        if self.relative_bias is not None:
+            # Compute attention scores
+            attn_scores = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, S, S]
 
-        # Use PyTorch's SDPA (auto-selects FlashAttention when possible)
-        attn_out = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=is_causal,
-        )  # [B, heads, S, head_dim]
+            # Add relative position bias
+            rel_bias = self.relative_bias(pos_xyz)  # [B, heads, S, S]
+            attn_scores = attn_scores + rel_bias
+
+            # Apply causal mask
+            if is_causal:
+                causal_mask = torch.triu(
+                    torch.full((seq_len, seq_len), float('-inf'), device=q.device, dtype=q.dtype),
+                    diagonal=1
+                )
+                attn_scores = attn_scores + causal_mask
+
+            # Apply padding mask if provided
+            if attention_mask is not None:
+                # attention_mask: [B, S] bool where True = valid, False = padding
+                padding_mask = torch.where(
+                    attention_mask.unsqueeze(1).unsqueeze(2),
+                    0.0, float('-inf')
+                ).to(q.dtype)
+                attn_scores = attn_scores + padding_mask
+
+            # Softmax and dropout
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+
+            # Apply to values
+            attn_out = attn_weights @ v  # [B, heads, S, head_dim]
+
+        else:
+            # Use PyTorch's SDPA (auto-selects FlashAttention when possible)
+            # Convert boolean mask to float attention mask for SDPA
+            attn_mask = None
+            use_is_causal = is_causal
+
+            if attention_mask is not None:
+                # attention_mask: [B, S] bool where True = valid, False = padding
+                # Convert to [B, 1, 1, S] float where 0.0 = valid, -inf = padding
+                bool_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                attn_mask = torch.where(bool_mask, 0.0, float('-inf')).to(q.dtype)
+
+                # MPS and some PyTorch versions don't support is_causal=True with explicit mask
+                # Build a combined causal + padding mask instead
+                if is_causal:
+                    # Create causal mask: [1, 1, S, S]
+                    causal_mask = torch.triu(
+                        torch.full((seq_len, seq_len), float('-inf'), device=q.device, dtype=q.dtype),
+                        diagonal=1
+                    ).unsqueeze(0).unsqueeze(0)
+                    # Combine: add causal mask to padding mask
+                    # attn_mask is [B, 1, 1, S], expand to [B, 1, S, S] for broadcasting
+                    attn_mask = attn_mask.expand(-1, -1, seq_len, -1) + causal_mask
+                    use_is_causal = False  # Causal is now baked into attn_mask
+
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=use_is_causal,
+            )  # [B, heads, S, head_dim]
 
         # Reshape back
         attn_out = attn_out.transpose(1, 2).reshape(batch, seq_len, self.config.d_model)
