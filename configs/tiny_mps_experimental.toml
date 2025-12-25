@@ -1,0 +1,76 @@
+# Tiny model config (~3.6M + ~0.5M refinement params) - for quick testing
+# Includes NEW experimental features: 3D relative bias, edge/grid encoding, refinement loop
+#
+# Use: uv run train --config tiny_mps_experimental
+#
+# Purpose: Fast validation that all new features work before longer training runs
+
+[model]
+size = "tiny"
+# 3D RoPE settings (existing)
+rope_type = "3d"
+norm_type = "rmsnorm"
+ffn_type = "swiglu"
+use_example_embedding = true
+
+# NEW: 3D Relative Position Bias
+use_relative_bias = true
+max_relative_dist_xy = 30
+max_relative_dist_z = 8
+
+# NEW: Edge and Grid Size Encoding
+use_edge_encoding = true
+use_grid_size_encoding = true
+
+# NEW: Refinement Loop Training
+num_refinement_steps = 3
+refinement_use_gating = true
+refinement_focus_output = true
+
+[data]
+path = "data/arc-agi_training_challenges.json"
+solutions_path = "data/arc-agi_training_solutions.json"
+max_seq_len = 1863
+
+[training]
+# Larger batch size since tiny model fits easily
+batch_size = 16
+effective_batch_size = 32
+epochs = 10
+lr = 3e-4
+weight_decay = 0.01
+grad_clip = 1.0
+warmup_fraction = 0.05
+
+[augmentation]
+apply_dihedral = true
+num_color_perms = 10
+color_seed = 42
+
+[hardware]
+compile_model = false
+use_amp = true
+num_workers = 4
+
+[checkpointing]
+save_dir = "checkpoints/tiny_mps_experimental"
+save_every = 5
+
+[logging]
+use_wandb = false
+log_every = 10
+wandb_log_every = 50
+ema_decay = 0.99
+
+[loss]
+uniform_loss_weight = true
+input_loss_weight = 1.0
+output_loss_weight = 1.0
+
+# Refinement loss settings
+refinement_loss_weighting = "linear"
+refinement_output_only = false
+
+[misc]
+seed = 42
+peak_tflops = 14.0
